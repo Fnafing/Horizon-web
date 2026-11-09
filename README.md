@@ -1,2 +1,4 @@
 # Horizon-web
-Minecraft rust port online
+Minecraft rust compiled to wasm and running in browser
+
+UNSTABLE
