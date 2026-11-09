@@ -1,0 +1,779 @@
+From 7fecccac9317ec925e455bd3aab517871a0a2308 Mon Sep 17 00:00:00 2001
+From: Skittle <skittle@localhost>
+Date: Mon, 9 Nov 2026 21:56:14 +0100
+Subject: [PATCH 3/4] web: horizon-web crate, args/env/paths in std, WebGL2
+ path, GPU work on canvas thread
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013ctixKwuqeX8BmwPkfP33r
+---
+ Cargo.lock                                    | 21 +++++
+ Cargo.toml                                    |  9 ++
+ crates/horizon-client-input/src/window.rs     |  6 ++
+ crates/horizon-client-lib/Cargo.toml          |  2 +-
+ crates/horizon-client-render/Cargo.toml       |  2 +-
+ crates/horizon-client-render/src/gfx.rs       | 16 ++++
+ crates/horizon-client-render/src/gfx/arena.rs |  6 +-
+ crates/horizon-client-render/src/gfx/cull.rs  |  2 +-
+ .../src/gfx/frame_gen.rs                      | 14 +++-
+ .../src/gfx/gpu_culling.rs                    |  2 +-
+ .../src/gfx/pack_center_depth.rs              |  2 +-
+ .../src/gfx/pack_post.rs                      | 30 ++++---
+ .../horizon-client-render/src/gfx/submit.rs   | 18 +++-
+ .../horizon-client-render/src/post_chain.rs   | 11 ++-
+ crates/horizon-client/Cargo.toml              |  2 +-
+ crates/horizon-web/Cargo.toml                 | 20 +++++
+ crates/horizon-web/src/lib.rs                 | 72 ++++++++++++++++
+ web/build.sh                                  | 23 ++++++
+ web/std/apply.py                              | 14 ++++
+ web/std/args_hzweb.rs                         | 43 ++++++++++
+ web/std/env_hzweb.rs                          | 36 ++++++++
+ web/std/os_hzweb.rs                           |  5 ++
+ web/std/paths_hzweb.rs                        | 82 +++++++++++++++++++
+ 23 files changed, 411 insertions(+), 27 deletions(-)
+ create mode 100644 crates/horizon-web/Cargo.toml
+ create mode 100644 crates/horizon-web/src/lib.rs
+ create mode 100755 web/build.sh
+ create mode 100644 web/std/args_hzweb.rs
+ create mode 100644 web/std/env_hzweb.rs
+ create mode 100644 web/std/paths_hzweb.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 56e6fac..f0b3722 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -587,6 +587,16 @@ dependencies = [
+  "crossbeam-utils",
+ ]
+ 
++[[package]]
++name = "console_error_panic_hook"
++version = "0.1.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
++dependencies = [
++ "cfg-if",
++ "wasm-bindgen",
++]
++
+ [[package]]
+ name = "const-oid"
+ version = "0.9.6"
+@@ -1995,6 +2005,17 @@ dependencies = [
+  "windows-sys 0.61.2",
+ ]
+ 
++[[package]]
++name = "horizon-web"
++version = "0.1.0"
++dependencies = [
++ "console_error_panic_hook",
++ "horizon-client",
++ "js-sys",
++ "log",
++ "wasm-bindgen",
++]
++
+ [[package]]
+ name = "horizon-world"
+ version = "0.1.0"
+diff --git a/Cargo.toml b/Cargo.toml
+index 148e191..3cde09f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -48,6 +48,7 @@ members = [
+     "crates/horizon-shader-api",
+     "crates/horizon-release-sign",
+     "crates/horizon-mod-deps",
++    "crates/horizon-web",
+     "xtask",
+ ]
+ resolver = "2"
+@@ -119,3 +120,11 @@ inherits = "release"
+ lto = false
+ codegen-units = 16
+ incremental = true
++
++# The browser build (web/build.sh): optimized, panics abort (no unwinding across Workers).
++[profile.web-release]
++inherits = "release"
++panic = "abort"
++debug = false
++lto = false
++codegen-units = 16
+diff --git a/crates/horizon-client-input/src/window.rs b/crates/horizon-client-input/src/window.rs
+index e004963..e33db82 100644
+--- a/crates/horizon-client-input/src/window.rs
++++ b/crates/horizon-client-input/src/window.rs
+@@ -667,6 +667,12 @@ pub fn with_horizon_icon(
+     #[cfg(target_os = "windows")]
+     let attributes =
+         winit::platform::windows::WindowAttributesExtWindows::with_taskbar_icon(attributes, icon);
++    // Browser: the window is a canvas appended to the page, which keeps the keys it handles.
++    #[cfg(target_arch = "wasm32")]
++    let attributes = {
++        use winit::platform::web::WindowAttributesExtWebSys;
++        attributes.with_append(true).with_prevent_default(true).with_focusable(true)
++    };
+     attributes
+ }
+ 
+diff --git a/crates/horizon-client-lib/Cargo.toml b/crates/horizon-client-lib/Cargo.toml
+index 1fe0e27..05565d6 100644
+--- a/crates/horizon-client-lib/Cargo.toml
++++ b/crates/horizon-client-lib/Cargo.toml
+@@ -241,7 +241,7 @@ path = "../horizon-client/examples/chunk_encoding_bench.rs"
+ 
+ [target.'cfg(target_arch = "wasm32")'.dependencies]
+ web-time = "1.1"
+-wgpu = { version = "30.0.1", default-features = false, features = ["webgpu", "webgl", "wgsl", "naga-ir", "fragile-send-sync-non-atomic-wasm"] }
++wgpu = { version = "30.0.1", default-features = false, features = ["webgpu", "webgl", "wgsl", "naga-ir"] }
+ getrandom = { version = "0.3", features = ["wasm_js"] }
+ getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
+ 
+diff --git a/crates/horizon-client-render/Cargo.toml b/crates/horizon-client-render/Cargo.toml
+index 5bbd5ff..ac08105 100644
+--- a/crates/horizon-client-render/Cargo.toml
++++ b/crates/horizon-client-render/Cargo.toml
+@@ -90,4 +90,4 @@ naga = { version = "30.0.1", features = ["wgsl-in", "hlsl-out", "glsl-out", "msl
+ 
+ [target.'cfg(target_arch = "wasm32")'.dependencies]
+ # Browser: WebGPU when the browser has it, else WebGL2 (wgpu picks at runtime).
+-wgpu = { version = "30.0.1", default-features = false, features = ["webgpu", "webgl", "wgsl", "naga-ir", "fragile-send-sync-non-atomic-wasm"] }
++wgpu = { version = "30.0.1", default-features = false, features = ["webgpu", "webgl", "wgsl", "naga-ir"] }
+diff --git a/crates/horizon-client-render/src/gfx.rs b/crates/horizon-client-render/src/gfx.rs
+index 8134f22..3a9637b 100644
+--- a/crates/horizon-client-render/src/gfx.rs
++++ b/crates/horizon-client-render/src/gfx.rs
+@@ -2047,6 +2047,10 @@ fn backend_order(
+     wgpu_backend: bool,
+ ) -> Vec<wgpu::Backends> {
+     use wgpu::Backends;
++    // Browser: WebGL2 (every browser with WebAssembly threads has it; its futures resolve at once).
++    if cfg!(target_arch = "wasm32") {
++        return vec![Backends::GL];
++    }
+     if os == "macos" || wgpu_backend {
+         return vec![Backends::default()];
+     }
+@@ -7399,10 +7403,22 @@ impl Renderer {
+             };
+             pack_post::PackPost::new(&device, &queue, &adapter, pack, format, world, &cancelled)
+         };
++        // Browser: shader packs would build on another thread, but WebGL only answers the
++        // canvas's thread; packs stay off there for now.
++        #[cfg(target_arch = "wasm32")]
++        {
++            drop(build);
++            log::warn!("shader pack {label}: not available in the browser build");
++            self.pack_loading = None;
++            self.pack_post = Some((dimension, None));
++            let _ = (started, cancel);
++        }
+         // A pack is not the game's code: a panic building it turns the pack off (#3525).
++        #[cfg(not(target_arch = "wasm32"))]
+         let thread = std::thread::Builder::new()
+             .name("Shader pack".into())
+             .spawn(move || crate::crash::contain(build));
++        #[cfg(not(target_arch = "wasm32"))]
+         match thread {
+             Ok(thread) => {
+                 // The last pack doesn't draw this dimension meanwhile.
+diff --git a/crates/horizon-client-render/src/gfx/arena.rs b/crates/horizon-client-render/src/gfx/arena.rs
+index 68b4f51..e7d8f1a 100644
+--- a/crates/horizon-client-render/src/gfx/arena.rs
++++ b/crates/horizon-client-render/src/gfx/arena.rs
+@@ -723,10 +723,14 @@ impl<T> Graveyard<T> {
+ 
+ /// Drops `items` on a short-lived thread of its own, as `chunk::free_columns` does for
+ /// unloaded chunks; should the thread not start, they drop here.
+-pub fn free_later<T: Send + 'static>(items: Vec<T>) {
++pub fn free_later<T: wgpu::WasmNotSend + 'static>(items: Vec<T>) {
+     if items.is_empty() {
+         return;
+     }
++    // Browser: GPU objects are freed on the canvas's thread, where WebGL answers.
++    #[cfg(target_arch = "wasm32")]
++    drop(items);
++    #[cfg(not(target_arch = "wasm32"))]
+     let _ = std::thread::Builder::new()
+         .name("Buffer freeing".into())
+         .spawn(move || drop(items));
+diff --git a/crates/horizon-client-render/src/gfx/cull.rs b/crates/horizon-client-render/src/gfx/cull.rs
+index 5285465..b73d8fc 100644
+--- a/crates/horizon-client-render/src/gfx/cull.rs
++++ b/crates/horizon-client-render/src/gfx/cull.rs
+@@ -676,7 +676,7 @@ impl Cull {
+ 
+     /// The frame's results to read back, started by calling it right after the frame's
+     /// submission (on the submit thread, when the frame goes there).
+-    pub fn submitted(&mut self) -> Option<impl FnOnce() + Send + 'static> {
++    pub fn submitted(&mut self) -> Option<impl FnOnce() + wgpu::WasmNotSend + 'static> {
+         let i = self.current.take()?;
+         let r = &self.readbacks[i];
+         let state = r.state.clone();
+diff --git a/crates/horizon-client-render/src/gfx/frame_gen.rs b/crates/horizon-client-render/src/gfx/frame_gen.rs
+index e205068..8dd1f24 100644
+--- a/crates/horizon-client-render/src/gfx/frame_gen.rs
++++ b/crates/horizon-client-render/src/gfx/frame_gen.rs
+@@ -451,7 +451,15 @@ impl Presenter {
+         let vsync = config.present_mode == wgpu::PresentMode::Fifo;
+         let failed = Arc::new(AtomicBool::new(false));
+         let failed_here = failed.clone();
+-        let thread = thread::Builder::new()
++        // Browser: no present thread (WebGL answers only on the canvas's thread), so frame
++        // generation fails at once and the renderer goes on without it.
++        #[cfg(target_arch = "wasm32")]
++        let thread: Option<thread::JoinHandle<()>> = {
++            let _ = (receive, give, device, queue, surface, window, vsync, failed_here);
++            None
++        };
++        #[cfg(not(target_arch = "wasm32"))]
++        let thread = Some(thread::Builder::new()
+             .name("Frame generation present".into())
+             .spawn(move || {
+                 let show = |texture: &wgpu::Texture| {
+@@ -503,13 +511,13 @@ impl Presenter {
+                     }
+                 }
+             })
+-            .expect("spawn the frame generation present thread");
++            .expect("spawn the frame generation present thread"));
+         Self {
+             config: config.clone(),
+             send: Some(send),
+             free,
+             failed,
+-            thread: Some(thread),
++            thread,
+         }
+     }
+ 
+diff --git a/crates/horizon-client-render/src/gfx/gpu_culling.rs b/crates/horizon-client-render/src/gfx/gpu_culling.rs
+index af457df..5d9c718 100644
+--- a/crates/horizon-client-render/src/gfx/gpu_culling.rs
++++ b/crates/horizon-client-render/src/gfx/gpu_culling.rs
+@@ -1527,7 +1527,7 @@ impl GpuCulling {
+     /// The frame's statistics to read back, started by calling it right after
+     /// the frame's submission (gfx's after-submit hook, on the submit thread
+     /// when the frame goes there), as `cull::Cull::submitted`.
+-    pub fn submitted(&mut self) -> Option<impl FnOnce() + Send + 'static> {
++    pub fn submitted(&mut self) -> Option<impl FnOnce() + wgpu::WasmNotSend + 'static> {
+         let i = self.current.take()?;
+         let r = &self.readbacks[i];
+         let (buffer, state) = (r.buffer.clone(), r.state.clone());
+diff --git a/crates/horizon-client-render/src/gfx/pack_center_depth.rs b/crates/horizon-client-render/src/gfx/pack_center_depth.rs
+index 31c3e5b..b220076 100644
+--- a/crates/horizon-client-render/src/gfx/pack_center_depth.rs
++++ b/crates/horizon-client-render/src/gfx/pack_center_depth.rs
+@@ -195,7 +195,7 @@ impl CenterDepth {
+ 
+     /// The readback of what the frame copied, to start by calling it right after the frame's
+     /// submission: on the submit thread when the frame goes there, as culling's readback.
+-    pub fn submitted(&mut self) -> Option<impl FnOnce() + Send + 'static> {
++    pub fn submitted(&mut self) -> Option<impl FnOnce() + wgpu::WasmNotSend + 'static> {
+         let copied: Vec<_> = self
+             .slots
+             .iter()
+diff --git a/crates/horizon-client-render/src/gfx/pack_post.rs b/crates/horizon-client-render/src/gfx/pack_post.rs
+index 15bad7c..dc96f1a 100644
+--- a/crates/horizon-client-render/src/gfx/pack_post.rs
++++ b/crates/horizon-client-render/src/gfx/pack_post.rs
+@@ -1471,18 +1471,26 @@ fn compile(
+         .min(jobs.len().max(1));
+     let next = AtomicUsize::new(0);
+     let refused = std::sync::Mutex::new(None);
++    let work = || {
++        while !cancel.load(Ordering::Relaxed)
++            && let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed))
++        {
++            if let Err(e) = checked(device, || job.create(device)) {
++                let mut refused = refused.lock().unwrap_or_else(|e| e.into_inner());
++                refused.get_or_insert((job.label().to_owned(), e));
++            }
++        }
++    };
++    // Browser: WebGL answers only on the canvas's thread.
++    #[cfg(target_arch = "wasm32")]
++    {
++        let _ = threads;
++        work();
++    }
++    #[cfg(not(target_arch = "wasm32"))]
+     std::thread::scope(|scope| {
+         for _ in 0..threads {
+-            scope.spawn(|| {
+-                while !cancel.load(Ordering::Relaxed)
+-                    && let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed))
+-                {
+-                    if let Err(e) = checked(device, || job.create(device)) {
+-                        let mut refused = refused.lock().unwrap_or_else(|e| e.into_inner());
+-                        refused.get_or_insert((job.label().to_owned(), e));
+-                    }
+-                }
+-            });
++            scope.spawn(&work);
+         }
+     });
+     refused.into_inner().unwrap_or_else(|e| e.into_inner())
+@@ -4346,7 +4354,7 @@ impl PackPost {
+ 
+     /// The centre depth the frame copied: its readback, started by calling it right after the
+     /// frame's submission.
+-    pub fn submitted(&mut self) -> Option<impl FnOnce() + Send + 'static> {
++    pub fn submitted(&mut self) -> Option<impl FnOnce() + wgpu::WasmNotSend + 'static> {
+         self.center_depth.as_mut()?.submitted()
+     }
+ 
+diff --git a/crates/horizon-client-render/src/gfx/submit.rs b/crates/horizon-client-render/src/gfx/submit.rs
+index ddb1067..6d654fc 100644
+--- a/crates/horizon-client-render/src/gfx/submit.rs
++++ b/crates/horizon-client-render/src/gfx/submit.rs
+@@ -16,6 +16,10 @@ use std::time::{Duration, Instant};
+ /// macOS's Metal it stalled: offscreen at render distance 12, a tenth to a half of the frame rate
+ /// with 20-180 ms p99 frames, against the same binary without it. Windows is not measured yet.
+ pub fn wanted() -> bool {
++    // Browser: WebGL can only be called from the canvas's thread.
++    if cfg!(target_arch = "wasm32") {
++        return false;
++    }
+     match std::env::var("HORIZON_SUBMIT_THREAD").as_deref() {
+         Ok("0") => false,
+         Ok("1") => true,
+@@ -24,7 +28,11 @@ pub fn wanted() -> bool {
+ }
+ 
+ /// Work to start right after a frame's submission (a readback's `map_async`).
++#[cfg(not(target_arch = "wasm32"))]
+ pub type AfterSubmit = Box<dyn FnOnce() + Send>;
++/// Browser: frames are submitted on the canvas's thread, so the hooks stay there.
++#[cfg(target_arch = "wasm32")]
++pub type AfterSubmit = Box<dyn FnOnce()>;
+ 
+ /// A frame for the submit thread: its commands and, in a window, the surface to present.
+ pub struct Job {
+@@ -66,9 +74,16 @@ impl Queue {
+             landing: Mutex::new(None),
+             waited: AtomicU64::new(0),
+         };
+-        if !threaded {
++        if !threaded || cfg!(target_arch = "wasm32") {
+             return this;
+         }
++        #[cfg(not(target_arch = "wasm32"))]
++        this.start_thread();
++        this
++    }
++    #[cfg(not(target_arch = "wasm32"))]
++    fn start_thread(&mut self) {
++        let this = self;
+         let (jobs, job_rx) = mpsc::channel::<Job>();
+         let (done_tx, done) = mpsc::channel();
+         let queue = this.queue.clone();
+@@ -99,7 +114,6 @@ impl Queue {
+             }
+             Err(e) => log::warn!("Horizon renderer: no submit thread ({e}); submitting in place"),
+         }
+-        this
+     }
+     fn lock(&self) -> std::sync::MutexGuard<'_, Option<Landing>> {
+         self.landing
+diff --git a/crates/horizon-client-render/src/post_chain.rs b/crates/horizon-client-render/src/post_chain.rs
+index e357927..e5fc8ae 100644
+--- a/crates/horizon-client-render/src/post_chain.rs
++++ b/crates/horizon-client-render/src/post_chain.rs
+@@ -719,9 +719,7 @@ impl PostEffects {
+         let (tx, rx) = mpsc::channel();
+         let (device, queue, root) = (device.clone(), queue.clone(), root.to_owned());
+         let format = format.remove_srgb_suffix();
+-        let spawned = std::thread::Builder::new()
+-            .name("Post effects".into())
+-            .spawn({
++        let work = {
+                 let ids = ids.clone();
+                 move || {
+                     for id in ids {
+@@ -738,7 +736,12 @@ impl PostEffects {
+                         }
+                     }
+                 }
+-            });
++            };
++        // Browser: WebGL answers only on the canvas's thread, so the chains load here.
++        #[cfg(target_arch = "wasm32")]
++        let spawned: std::io::Result<()> = Ok(work());
++        #[cfg(not(target_arch = "wasm32"))]
++        let spawned = std::thread::Builder::new().name("Post effects".into()).spawn(work);
+         if spawned.is_ok() {
+             self.pending.extend(ids);
+             self.preloading = Some((self.root.clone(), rx));
+diff --git a/crates/horizon-client/Cargo.toml b/crates/horizon-client/Cargo.toml
+index 1a6a6f2..d16089e 100644
+--- a/crates/horizon-client/Cargo.toml
++++ b/crates/horizon-client/Cargo.toml
+@@ -186,4 +186,4 @@ fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
+ [target.'cfg(target_arch = "wasm32")'.dependencies]
+ web-time = "1.1"
+ # Browser: WebGPU when the browser has it, else WebGL2 (wgpu picks at runtime).
+-wgpu = { version = "30.0.1", default-features = false, features = ["webgpu", "webgl", "wgsl", "naga-ir", "fragile-send-sync-non-atomic-wasm"] }
++wgpu = { version = "30.0.1", default-features = false, features = ["webgpu", "webgl", "wgsl", "naga-ir"] }
+diff --git a/crates/horizon-web/Cargo.toml b/crates/horizon-web/Cargo.toml
+new file mode 100644
+index 0000000..ce4d09a
+--- /dev/null
++++ b/crates/horizon-web/Cargo.toml
+@@ -0,0 +1,20 @@
++[package]
++name = "horizon-web"
++version = "0.1.0"
++edition.workspace = true
++license.workspace = true
++rust-version.workspace = true
++description = "Horizon in the browser: wasm entry point, virtual filesystem hooks and thread entry (web/README.md)"
++
++[lib]
++crate-type = ["cdylib"]
++
++[dependencies]
++horizon-client = { path = "../horizon-client", default-features = false }
++wasm-bindgen = "0.2.129"
++js-sys = "0.3"
++console_error_panic_hook = "0.1"
++log = "0.4"
++
++[lints]
++workspace = true
+diff --git a/crates/horizon-web/src/lib.rs b/crates/horizon-web/src/lib.rs
+new file mode 100644
+index 0000000..c80d70c
+--- /dev/null
++++ b/crates/horizon-web/src/lib.rs
+@@ -0,0 +1,72 @@
++//! Horizon in the browser. Built with the patched std of `web/std` (an in-memory filesystem,
++//! the browser's clock, threads as Web Workers): `web/build.sh`. JS (`web/runtime`) fills
++//! the filesystem from the player's .hzpack, sets the arguments and calls [`run`].
++#![feature(hzweb)]
++
++use wasm_bindgen::prelude::*;
++
++/// Where the prepared resources (the .hzpack's `res/`) are mounted.
++pub const RESOURCES: &str = "/horizon/resources";
++/// The game's home: options, saves, logs (persisted to IndexedDB).
++pub const HOME: &str = "/home/player/horizon";
++
++/// Entry of a thread's worker (`web/runtime/hzweb_worker.js`).
++#[wasm_bindgen]
++pub fn hzweb_thread_start(arg: u32) {
++    // SAFETY: called once per spawn with the value std handed to `hz_spawn`.
++    unsafe { std::os::hzweb::thread_start(arg) }
++}
++
++/// Puts one file into the virtual filesystem. `record`: report it back as changed.
++#[wasm_bindgen]
++pub fn hz_put(path: &str, data: Vec<u8>, record: bool) {
++    std::os::hzweb::put(std::path::Path::new(path), data, record);
++}
++
++/// Creates a directory (and parents) without reporting it as changed.
++#[wasm_bindgen]
++pub fn hz_mkdirs(path: &str) {
++    std::os::hzweb::mkdirs(std::path::Path::new(path));
++}
++
++/// Number of files and directories in the virtual filesystem.
++#[wasm_bindgen]
++pub fn hz_file_count() -> usize {
++    std::os::hzweb::file_count()
++}
++
++/// The next changed path: `[path, Uint8Array]` for a file (directories end in '/'),
++/// `[path, null]` for a removed one, `undefined` when nothing changed.
++#[wasm_bindgen]
++pub fn hz_take_change() -> JsValue {
++    match std::os::hzweb::take_change() {
++        None => JsValue::UNDEFINED,
++        Some((path, data)) => {
++            let out = js_sys::Array::new();
++            out.push(&JsValue::from_str(&path));
++            out.push(&match data {
++                Some(bytes) => js_sys::Uint8Array::from(bytes.as_slice()).into(),
++                None => JsValue::NULL,
++            });
++            out.into()
++        }
++    }
++}
++
++/// Sets an environment variable for the game.
++#[wasm_bindgen]
++pub fn hz_set_env(key: &str, value: &str) {
++    // SAFETY: called before the game starts its threads.
++    unsafe { std::env::set_var(key, value) };
++}
++
++/// Starts the game with these arguments (the program name is added). Never returns
++/// normally: winit's web event loop takes over through a JS exception.
++#[wasm_bindgen]
++pub fn hz_run(args: Vec<String>) {
++    console_error_panic_hook::set_once();
++    let mut all = vec!["horizon".to_string()];
++    all.extend(args);
++    std::os::hzweb::set_args(all);
++    horizon_client::entry::main();
++}
+diff --git a/web/build.sh b/web/build.sh
+new file mode 100755
+index 0000000..1da4fb9
+--- /dev/null
++++ b/web/build.sh
+@@ -0,0 +1,23 @@
++#!/usr/bin/env bash
++# Builds Horizon for the browser into web/dist: patched std (web/std), wasm threads, WebGL2.
++# Usage: web/build.sh [check|debug|release]  (default release)
++set -euo pipefail
++cd "$(dirname "$0")/.."
++MODE=${1:-release}
++python3 web/std/apply.py >/dev/null
++export RUSTFLAGS="-C target-feature=+atomics,+bulk-memory,+mutable-globals,+nontrapping-fptoint,+sign-ext \
++ -C link-arg=--shared-memory -C link-arg=--max-memory=4294967296 -C link-arg=--import-memory \
++ -C link-arg=--export=__wasm_init_tls -C link-arg=--export=__tls_size -C link-arg=--export=__tls_align \
++ -C link-arg=--export=__tls_base -C link-arg=-zstack-size=4194304 --cfg getrandom_backend=\"wasm_js\""
++ARGS=(--target wasm32-unknown-unknown -Zbuild-std=std,panic_abort -p horizon-web --target-dir target/web)
++case "$MODE" in
++  check) exec cargo +nightly check "${ARGS[@]}" ;;
++  debug) cargo +nightly build "${ARGS[@]}"; PROFILE=debug ;;
++  release) cargo +nightly build --profile web-release "${ARGS[@]}"; PROFILE=web-release ;;
++esac
++OUT=web/dist
++rm -rf "$OUT"; mkdir -p "$OUT"
++wasm-bindgen --target web --out-dir "$OUT" "target/web/wasm32-unknown-unknown/$PROFILE/horizon_web.wasm"
++python3 web/runtime/fix_glue.py "$OUT/horizon_web.js"
++cp web/runtime/hzweb.js web/runtime/hzweb_worker.js web/launcher/* "$OUT/" 2>/dev/null || true
++ls -la "$OUT"
+diff --git a/web/std/apply.py b/web/std/apply.py
+index 7b1d7b2..a03a557 100644
+--- a/web/std/apply.py
++++ b/web/std/apply.py
+@@ -36,6 +36,9 @@ copy("fs_hzweb.rs", "sys/fs/hzweb.rs")
+ copy("time_hzweb.rs", "sys/time/hzweb.rs")
+ copy("thread_hzweb.rs", "sys/thread/hzweb.rs")
+ copy("os_hzweb.rs", "os/hzweb.rs")
++copy("args_hzweb.rs", "sys/args/hzweb.rs")
++copy("env_hzweb.rs", "sys/env/hzweb.rs")
++copy("paths_hzweb.rs", "sys/paths/hzweb.rs")
+ 
+ # fs: our module before the catch-all, plus the hooks std::os::hzweb calls.
+ patch("sys/fs/mod.rs", "    _ => {\n        mod unsupported;\n        use unsupported as imp;\n    }\n}",
+@@ -74,6 +77,17 @@ patch("sys/sync/futex/wasm.rs",
+       "        return true;\n"
+       "    }\n")
+ 
++# args, env, paths.
++patch("sys/args/mod.rs", "    _ => {\n        mod unsupported;\n        pub use unsupported::*;",
++      f"    {WEB} => {{\n        mod hzweb;\n        pub use hzweb::{{Args, args}};\n        pub(crate) use hzweb::set as hzweb_set_args;\n    }}\n"
++      "    _ => {\n        mod unsupported;\n        pub use unsupported::*;")
++patch("sys/env/mod.rs", "    _ => {\n        mod unsupported;\n        pub use unsupported::*;",
++      f"    {WEB} => {{\n        mod hzweb;\n        pub use hzweb::*;\n    }}\n"
++      "    _ => {\n        mod unsupported;\n        pub use unsupported::*;")
++patch("sys/paths/mod.rs", "    _ => {\n        mod unsupported;\n        use unsupported as imp;",
++      f"    {WEB} => {{\n        mod hzweb;\n        use hzweb as imp;\n    }}\n"
++      "    _ => {\n        mod unsupported;\n        use unsupported as imp;")
++
+ # threads wait on the futex directly.
+ patch("sys/sync/mod.rs", "mod futex;\n", "pub(crate) mod futex;\n")
+ 
+diff --git a/web/std/args_hzweb.rs b/web/std/args_hzweb.rs
+new file mode 100644
+index 0000000..e1a1cbf
+--- /dev/null
++++ b/web/std/args_hzweb.rs
+@@ -0,0 +1,43 @@
++//! Horizon web: command-line arguments set by JS (`std::os::hzweb::set_args`).
++use crate::ffi::OsString;
++use crate::fmt;
++use crate::sync::Mutex;
++
++static ARGS: Mutex<Vec<OsString>> = Mutex::new(Vec::new());
++
++pub fn set(args: Vec<String>) {
++    *ARGS.lock().unwrap() = args.into_iter().map(OsString::from).collect();
++}
++
++pub struct Args {
++    iter: crate::vec::IntoIter<OsString>,
++}
++
++pub fn args() -> Args {
++    Args { iter: ARGS.lock().unwrap().clone().into_iter() }
++}
++
++impl fmt::Debug for Args {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_list().entries(self.iter.as_slice()).finish()
++    }
++}
++impl Iterator for Args {
++    type Item = OsString;
++    fn next(&mut self) -> Option<OsString> {
++        self.iter.next()
++    }
++    fn size_hint(&self) -> (usize, Option<usize>) {
++        self.iter.size_hint()
++    }
++}
++impl DoubleEndedIterator for Args {
++    fn next_back(&mut self) -> Option<OsString> {
++        self.iter.next_back()
++    }
++}
++impl ExactSizeIterator for Args {
++    fn len(&self) -> usize {
++        self.iter.len()
++    }
++}
+diff --git a/web/std/env_hzweb.rs b/web/std/env_hzweb.rs
+new file mode 100644
+index 0000000..da7d12b
+--- /dev/null
++++ b/web/std/env_hzweb.rs
+@@ -0,0 +1,36 @@
++//! Horizon web: a process environment kept in wasm memory (shared by all threads).
++use crate::collections::BTreeMap;
++use crate::ffi::{OsStr, OsString};
++use crate::sync::Mutex;
++use crate::{fmt, io};
++
++static ENV: Mutex<BTreeMap<OsString, OsString>> = Mutex::new(BTreeMap::new());
++
++pub struct Env {
++    iter: crate::collections::btree_map::IntoIter<OsString, OsString>,
++}
++impl fmt::Debug for Env {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str("Env")
++    }
++}
++impl Iterator for Env {
++    type Item = (OsString, OsString);
++    fn next(&mut self) -> Option<(OsString, OsString)> {
++        self.iter.next()
++    }
++}
++pub fn env() -> Env {
++    Env { iter: ENV.lock().unwrap().clone().into_iter() }
++}
++pub fn getenv(k: &OsStr) -> Option<OsString> {
++    ENV.lock().unwrap().get(k).cloned()
++}
++pub unsafe fn setenv(k: &OsStr, v: &OsStr) -> io::Result<()> {
++    ENV.lock().unwrap().insert(k.to_owned(), v.to_owned());
++    Ok(())
++}
++pub unsafe fn unsetenv(k: &OsStr) -> io::Result<()> {
++    ENV.lock().unwrap().remove(k);
++    Ok(())
++}
+diff --git a/web/std/os_hzweb.rs b/web/std/os_hzweb.rs
+index c40ed7b..2d83bc8 100644
+--- a/web/std/os_hzweb.rs
++++ b/web/std/os_hzweb.rs
+@@ -36,3 +36,8 @@ pub unsafe fn thread_start(arg: u32) {
+ pub fn is_main_thread() -> bool {
+     crate::sys::thread::hzweb_is_main()
+ }
++
++/// Sets what `std::env::args()` returns (the program name first).
++pub fn set_args(args: Vec<String>) {
++    crate::sys::args::hzweb_set_args(args)
++}
+diff --git a/web/std/paths_hzweb.rs b/web/std/paths_hzweb.rs
+new file mode 100644
+index 0000000..180ce71
+--- /dev/null
++++ b/web/std/paths_hzweb.rs
+@@ -0,0 +1,82 @@
++//! Horizon web: the virtual filesystem's paths. The working directory is changeable.
++use crate::ffi::{OsStr, OsString};
++use crate::path::{self, Path, PathBuf};
++use crate::sync::Mutex;
++use crate::{fmt, io};
++
++static CWD: Mutex<Option<PathBuf>> = Mutex::new(None);
++
++pub fn getcwd() -> io::Result<PathBuf> {
++    Ok(CWD.lock().unwrap().clone().unwrap_or_else(|| PathBuf::from("/")))
++}
++pub fn chdir(p: &path::Path) -> io::Result<()> {
++    let to = if p.is_absolute() { p.to_path_buf() } else { getcwd()?.join(p) };
++    if !crate::sys::fs::exists(&to)? {
++        return Err(io::const_error!(io::ErrorKind::NotFound, "No such file or directory"));
++    }
++    *CWD.lock().unwrap() = Some(to);
++    Ok(())
++}
++
++pub struct SplitPaths<'a> {
++    iter: crate::str::Split<'a, char>,
++}
++pub struct SplitPathsRef<'a> {
++    iter: crate::str::Split<'a, char>,
++}
++pub fn split_paths(unparsed: &OsStr) -> SplitPaths<'_> {
++    SplitPaths { iter: unparsed.to_str().unwrap_or("").split(':') }
++}
++pub fn split_paths_ref(unparsed: &OsStr) -> Option<SplitPathsRef<'_>> {
++    Some(SplitPathsRef { iter: unparsed.to_str()?.split(':') })
++}
++impl<'a> Iterator for SplitPaths<'a> {
++    type Item = PathBuf;
++    fn next(&mut self) -> Option<PathBuf> {
++        self.iter.next().map(PathBuf::from)
++    }
++}
++impl<'a> Iterator for SplitPathsRef<'a> {
++    type Item = &'a Path;
++    fn next(&mut self) -> Option<&'a Path> {
++        self.iter.next().map(Path::new)
++    }
++}
++
++#[derive(Debug)]
++pub struct JoinPathsError;
++pub fn join_paths<I, T>(paths: I) -> Result<OsString, JoinPathsError>
++where
++    I: Iterator<Item = T>,
++    T: AsRef<OsStr>,
++{
++    let mut out = OsString::new();
++    for (i, p) in paths.enumerate() {
++        let p = p.as_ref();
++        if p.to_str().is_some_and(|s| s.contains(':')) {
++            return Err(JoinPathsError);
++        }
++        if i > 0 {
++            out.push(":");
++        }
++        out.push(p);
++    }
++    Ok(out)
++}
++impl fmt::Display for JoinPathsError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        "path segment contains separator `:`".fmt(f)
++    }
++}
++impl crate::error::Error for JoinPathsError {}
++
++pub fn current_exe() -> io::Result<PathBuf> {
++    Ok(PathBuf::from("/horizon/horizon"))
++}
++pub fn temp_dir() -> PathBuf {
++    let _ = crate::sys::fs::DirBuilder::new().mkdir(Path::new("/tmp"));
++    PathBuf::from("/tmp")
++}
++pub fn home_dir() -> Option<PathBuf> {
++    Some(PathBuf::from("/home/player"))
++}
+-- 
+2.43.0
+

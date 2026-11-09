@@ -1,0 +1,9 @@
+[package]
+name = "socket2"
+version = "0.5.10"
+edition = "2021"
+description = "Stub socket2 for wasm32: types exist, every socket call fails with Unsupported."
+license = "MIT"
+
+[features]
+all = []

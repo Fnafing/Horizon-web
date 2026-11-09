@@ -1,0 +1,11 @@
+[package]
+name = "mio"
+version = "1.2.4"
+edition = "2021"
+description = "Stub mio for wasm32: Poll never reports events, sockets can't exist."
+license = "MIT"
+
+[features]
+os-poll = []
+net = []
+os-ext = []

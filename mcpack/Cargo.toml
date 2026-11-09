@@ -1,0 +1,18 @@
+[package]
+name = "mcpack"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }
+serde_json = "1"
+walkdir = "2"
+vorbis_rs = "0.5.6"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+
+[target.'cfg(windows)'.dependencies]
+rfd = { version = "0.15", default-features = false }

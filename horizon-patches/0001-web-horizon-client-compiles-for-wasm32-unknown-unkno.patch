@@ -1,0 +1,1337 @@
+From 8c2fff114b54dcb8fecfeeb918376d70e55b48db Mon Sep 17 00:00:00 2001
+From: Skittle <skittle@localhost>
+Date: Mon, 9 Nov 2026 21:31:32 +0100
+Subject: [PATCH 1/4] web: horizon-client compiles for wasm32-unknown-unknown
+
+Offline stubs for ureq/mio/socket2 (patched on this branch), mimalloc/fs4/arboard/
+if-addrs/hidapi gated to native, Vulkan HDR off, wgpu webgpu+webgl, winit web clock bridge.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013ctixKwuqeX8BmwPkfP33r
+---
+ Cargo.lock                                    |  69 +++------
+ Cargo.toml                                    |   5 +
+ crates/horizon-client-input/Cargo.toml        |   4 +-
+ crates/horizon-client-input/src/clipboard.rs  |  21 +++
+ crates/horizon-client-input/src/keybinds.rs   |   8 +-
+ crates/horizon-client-lib/Cargo.toml          |  10 +-
+ crates/horizon-client-render/Cargo.toml       |   4 +
+ crates/horizon-client-render/src/zip.rs       |   7 +
+ crates/horizon-client/Cargo.toml              |   9 +-
+ crates/horizon-client/src/discord_presence.rs |   5 +
+ crates/horizon-client/src/game/event_loop.rs  |  31 +++-
+ crates/horizon-client/src/game/headless.rs    |   2 +-
+ .../horizon-client/src/game/no_resources.rs   |   2 +-
+ .../horizon-client/src/game/window_handler.rs |   2 +-
+ crates/horizon-client/src/save.rs             |   3 +
+ crates/horizon-dualsense/Cargo.toml           |   2 +-
+ crates/horizon-dualsense/src/device.rs        |  36 ++---
+ crates/horizon-dualsense/src/lib.rs           |   4 +-
+ crates/horizon-friends/Cargo.toml             |   4 +-
+ crates/horizon-friends/src/reach.rs           |  20 ++-
+ crates/horizon-hdr/src/lib.rs                 |  15 +-
+ crates/horizon-threads/Cargo.toml             |   2 +
+ crates/horizon-threads/src/heap_census.rs     |   4 +-
+ crates/horizon-threads/src/lib.rs             |  13 ++
+ web/stubs/mio/Cargo.toml                      |  11 ++
+ web/stubs/mio/src/lib.rs                      | 101 +++++++++++++
+ web/stubs/socket2-0.5.10/Cargo.toml           |   9 ++
+ web/stubs/socket2-0.5.10/src/lib.rs           |  69 +++++++++
+ web/stubs/socket2-0.6.5/Cargo.toml            |   9 ++
+ web/stubs/socket2-0.6.5/src/lib.rs            |  69 +++++++++
+ web/stubs/ureq/Cargo.toml                     |  21 +++
+ web/stubs/ureq/src/lib.rs                     | 137 ++++++++++++++++++
+ 32 files changed, 620 insertions(+), 88 deletions(-)
+ create mode 100644 web/stubs/mio/Cargo.toml
+ create mode 100644 web/stubs/mio/src/lib.rs
+ create mode 100644 web/stubs/socket2-0.5.10/Cargo.toml
+ create mode 100644 web/stubs/socket2-0.5.10/src/lib.rs
+ create mode 100644 web/stubs/socket2-0.6.5/Cargo.toml
+ create mode 100644 web/stubs/socket2-0.6.5/src/lib.rs
+ create mode 100644 web/stubs/ureq/Cargo.toml
+ create mode 100644 web/stubs/ureq/src/lib.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 08e6eea..56e6fac 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1158,9 +1158,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
+ dependencies = [
+  "cfg-if",
++ "js-sys",
+  "libc",
+  "r-efi 5.3.0",
+  "wasip2",
++ "wasm-bindgen",
+ ]
+ 
+ [[package]]
+@@ -1482,6 +1484,7 @@ dependencies = [
+  "toml",
+  "unicode-bidi",
+  "ureq",
++ "web-time",
+  "wgpu",
+  "winit",
+  "winresource",
+@@ -1517,6 +1520,7 @@ dependencies = [
+  "crc32fast",
+  "flate2",
+  "fs4",
++ "getrandom 0.2.17",
+  "getrandom 0.3.4",
+  "gilrs",
+  "glam",
+@@ -1561,6 +1565,7 @@ dependencies = [
+  "sha2",
+  "unicode-bidi",
+  "ureq",
++ "web-time",
+  "wgpu",
+  "winit",
+  "xxhash-rust",
+@@ -2549,14 +2554,6 @@ dependencies = [
+ [[package]]
+ name = "mio"
+ version = "1.2.4"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "1788edb87fdc09c7e26304471e2f5be8cdefb1b6930d6e3985fc02ff53bf86ee"
+-dependencies = [
+- "libc",
+- "log",
+- "wasi",
+- "windows-sys 0.61.2",
+-]
+ 
+ [[package]]
+ name = "multiversion_no_op"
+@@ -2589,7 +2586,7 @@ dependencies = [
+  "twox-hash",
+  "url",
+  "webpki",
+- "webpki-roots 1.0.10",
++ "webpki-roots",
+ ]
+ 
+ [[package]]
+@@ -4132,33 +4129,10 @@ checksum = "199905e6153d6405f9728fe44daace35f8f837bbf830bb6e85fbd5828709a886"
+ [[package]]
+ name = "socket2"
+ version = "0.5.10"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
+-dependencies = [
+- "libc",
+- "windows-sys 0.52.0",
+-]
+ 
+ [[package]]
+ name = "socket2"
+ version = "0.6.5"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
+-dependencies = [
+- "libc",
+- "windows-sys 0.61.2",
+-]
+-
+-[[package]]
+-name = "socks"
+-version = "0.3.4"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "f0c3dbbd9ae980613c6dd8e28a9407b50509d3803b57624d5dfe8315218cd58b"
+-dependencies = [
+- "byteorder",
+- "libc",
+- "winapi",
+-]
+ 
+ [[package]]
+ name = "spake2"
+@@ -4630,17 +4604,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
+ [[package]]
+ name = "ureq"
+ version = "2.12.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "02d1a66277ed75f640d608235660df48c8e3c19f3b4edb6a263315626cc3c01d"
+ dependencies = [
+- "base64 0.22.1",
+- "log",
+- "once_cell",
+- "rustls",
+- "rustls-pki-types",
+- "socks",
+- "url",
+- "webpki-roots 0.26.11",
++ "serde",
++ "serde_json",
+ ]
+ 
+ [[package]]
+@@ -4922,15 +4888,6 @@ dependencies = [
+  "untrusted",
+ ]
+ 
+-[[package]]
+-name = "webpki-roots"
+-version = "0.26.11"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+-dependencies = [
+- "webpki-roots 1.0.10",
+-]
+-
+ [[package]]
+ name = "webpki-roots"
+ version = "1.0.10"
+@@ -5004,6 +4961,7 @@ dependencies = [
+  "thiserror 2.0.21",
+  "wgpu-core-deps-apple",
+  "wgpu-core-deps-emscripten",
++ "wgpu-core-deps-wasm",
+  "wgpu-core-deps-windows-linux-android",
+  "wgpu-hal",
+  "wgpu-naga-bridge",
+@@ -5028,6 +4986,15 @@ dependencies = [
+  "wgpu-hal",
+ ]
+ 
++[[package]]
++name = "wgpu-core-deps-wasm"
++version = "30.0.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d260ca2ca8adc654f513a869bf3cac0b47f5b8d3f87803d6942015f8de597aae"
++dependencies = [
++ "wgpu-hal",
++]
++
+ [[package]]
+ name = "wgpu-core-deps-windows-linux-android"
+ version = "30.0.1"
+diff --git a/Cargo.toml b/Cargo.toml
+index adda3a1..148e191 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -76,6 +76,11 @@ large_enum_variant = "allow"
+ # frame wait for the GPU to finish the one before (#4604).
+ # Drop this and the folder once a wgpu release has these fixes.
+ [patch.crates-io]
++# Browser build (web branch): offline network stub.
++ureq = { path = "web/stubs/ureq" }
++socket2_05 = { package = "socket2", path = "web/stubs/socket2-0.5.10" }
++mio = { path = "web/stubs/mio" }
++socket2_06 = { package = "socket2", path = "web/stubs/socket2-0.6.5" }
+ wgpu-hal = { path = "third_party/wgpu-hal" }
+ # naga 30.0.1, with the fixes to its GLSL frontend that shader packs need (THIRD_PARTY_NOTICES.md).
+ naga = { path = "third_party/naga" }
+diff --git a/crates/horizon-client-input/Cargo.toml b/crates/horizon-client-input/Cargo.toml
+index 9edc002..b1412fd 100644
+--- a/crates/horizon-client-input/Cargo.toml
++++ b/crates/horizon-client-input/Cargo.toml
+@@ -12,10 +12,12 @@ winit = "0.30.13"
+ # The window icon.
+ horizon-theme = { path = "../horizon-theme" }
+ png = "0.18"
+-arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
+ 
+ [features]
+ controllers = []
+ 
+ [lints]
+ workspace = true
++
++[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
++arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
+diff --git a/crates/horizon-client-input/src/clipboard.rs b/crates/horizon-client-input/src/clipboard.rs
+index eaf2a22..cc20299 100644
+--- a/crates/horizon-client-input/src/clipboard.rs
++++ b/crates/horizon-client-input/src/clipboard.rs
+@@ -119,6 +119,27 @@ pub trait Clipboard {
+     fn set(&mut self, text: &str);
+ }
+ 
++/// Browser build: no synchronous system clipboard; copy/paste stays inside the game.
++#[cfg(target_arch = "wasm32")]
++mod arboard {
++    pub struct Clipboard;
++    pub enum Error {
++        ContentNotAvailable,
++        ClipboardNotSupported,
++    }
++    impl Clipboard {
++        pub fn new() -> Result<Clipboard, Error> {
++            Err(Error::ClipboardNotSupported)
++        }
++        pub fn get_text(&mut self) -> Result<String, Error> {
++            Err(Error::ContentNotAvailable)
++        }
++        pub fn set_text(&mut self, _: String) -> Result<(), Error> {
++            Err(Error::ClipboardNotSupported)
++        }
++    }
++}
++
+ /// The system clipboard (`ClipboardManager`). On Wayland, arboard uses the
+ /// data-control protocol and falls back to X11 (XWayland) on compositors
+ /// without it. When no system clipboard can be reached, text copied in the
+diff --git a/crates/horizon-client-input/src/keybinds.rs b/crates/horizon-client-input/src/keybinds.rs
+index 63274cb..8cbc2eb 100644
+--- a/crates/horizon-client-input/src/keybinds.rs
++++ b/crates/horizon-client-input/src/keybinds.rs
+@@ -300,6 +300,7 @@ pub use horizon_client_core::key_display::display_name;
+ /// Q key shows A.
+ pub fn learn_layout(event: &winit::event::KeyEvent) {
+     use winit::keyboard::{Key, PhysicalKey};
++    #[cfg(not(target_arch = "wasm32"))]
+     use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+     let PhysicalKey::Code(code) = event.physical_key else {
+         return;
+@@ -308,7 +309,12 @@ pub fn learn_layout(event: &winit::event::KeyEvent) {
+         return;
+     };
+     let learn = horizon_client_core::key_display::learn_layout;
+-    match event.key_without_modifiers() {
++    // The browser reports no unmodified key; the logical key is close enough.
++    #[cfg(target_arch = "wasm32")]
++    let key = event.logical_key.clone();
++    #[cfg(not(target_arch = "wasm32"))]
++    let key = event.key_without_modifiers();
++    match key {
+         Key::Character(text) => learn(name, &text),
+         Key::Dead(Some(c)) => learn(name, c.encode_utf8(&mut [0; 4])),
+         _ => {}
+diff --git a/crates/horizon-client-lib/Cargo.toml b/crates/horizon-client-lib/Cargo.toml
+index 69915de..1fe0e27 100644
+--- a/crates/horizon-client-lib/Cargo.toml
++++ b/crates/horizon-client-lib/Cargo.toml
+@@ -82,7 +82,6 @@ gilrs = { version = "0.11", optional = true }
+ ureq = { version = "2", default-features = false, features = ["tls"] }
+ unicode-bidi = "0.3.18"
+ # `LevelStorageAccess.estimateDiskSpace`: usable disk space, without unsafe code on Windows.
+-fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
+ 
+ [target.'cfg(unix)'.dependencies]
+ # The server thread's CPU time per tick (`HORIZON_SPIKES`, spans.rs).
+@@ -239,3 +238,12 @@ path = "../horizon-client/tests/wide_states.rs"
+ [[example]]
+ name = "chunk_encoding_bench"
+ path = "../horizon-client/examples/chunk_encoding_bench.rs"
++
++[target.'cfg(target_arch = "wasm32")'.dependencies]
++web-time = "1.1"
++wgpu = { version = "30.0.1", default-features = false, features = ["webgpu", "webgl", "wgsl", "naga-ir", "fragile-send-sync-non-atomic-wasm"] }
++getrandom = { version = "0.3", features = ["wasm_js"] }
++getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
++
++[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
++fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
+diff --git a/crates/horizon-client-render/Cargo.toml b/crates/horizon-client-render/Cargo.toml
+index 7c613fc..5bbd5ff 100644
+--- a/crates/horizon-client-render/Cargo.toml
++++ b/crates/horizon-client-render/Cargo.toml
+@@ -87,3 +87,7 @@ workspace = true
+ [dev-dependencies]
+ horizon-items = { path = "../horizon-items", features = ["test-support"] }
+ naga = { version = "30.0.1", features = ["wgsl-in", "hlsl-out", "glsl-out", "msl-out", "spv-out"] }
++
++[target.'cfg(target_arch = "wasm32")'.dependencies]
++# Browser: WebGPU when the browser has it, else WebGL2 (wgpu picks at runtime).
++wgpu = { version = "30.0.1", default-features = false, features = ["webgpu", "webgl", "wgsl", "naga-ir", "fragile-send-sync-non-atomic-wasm"] }
+diff --git a/crates/horizon-client-render/src/zip.rs b/crates/horizon-client-render/src/zip.rs
+index beb518d..7e6aaee 100644
+--- a/crates/horizon-client-render/src/zip.rs
++++ b/crates/horizon-client-render/src/zip.rs
+@@ -43,6 +43,13 @@ fn read_at(file: &fs::File, out: &mut [u8], at: u64) -> io::Result<usize> {
+     return std::os::unix::fs::FileExt::read_at(file, out, at);
+     #[cfg(windows)]
+     return std::os::windows::fs::FileExt::seek_read(file, out, at);
++    #[cfg(not(any(unix, windows)))]
++    {
++        use std::io::{Read, Seek, SeekFrom};
++        let mut file = file;
++        file.seek(SeekFrom::Start(at))?;
++        file.read(out)
++    }
+ }
+ /// The bytes of `file` from `start` to `end`.
+ fn read_range(file: &fs::File, start: u64, end: u64) -> io::Result<Vec<u8>> {
+diff --git a/crates/horizon-client/Cargo.toml b/crates/horizon-client/Cargo.toml
+index d87b81d..1a6a6f2 100644
+--- a/crates/horizon-client/Cargo.toml
++++ b/crates/horizon-client/Cargo.toml
+@@ -82,7 +82,6 @@ horizon-dualsense = { path = "../horizon-dualsense", optional = true }
+ ureq = { version = "2", default-features = false, features = ["tls"] }
+ unicode-bidi = "0.3.18"
+ # `LevelStorageAccess.estimateDiskSpace`: usable disk space, without unsafe code on Windows.
+-fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
+ 
+ [target.'cfg(unix)'.dependencies]
+ # The server thread's CPU time per tick (`HORIZON_SPIKES`, spans.rs).
+@@ -180,3 +179,11 @@ horizon-client-render = { path = "../horizon-client-render", features = ["test-s
+ horizon-items = { path = "../horizon-items", features = ["test-support"] }
+ # Every WGSL shader translated as wgpu's DirectX 12 backend does (gfx.rs tests).
+ naga = { version = "30.0.1", features = ["wgsl-in", "hlsl-out", "msl-out", "spv-out"] }
++
++[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
++fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
++
++[target.'cfg(target_arch = "wasm32")'.dependencies]
++web-time = "1.1"
++# Browser: WebGPU when the browser has it, else WebGL2 (wgpu picks at runtime).
++wgpu = { version = "30.0.1", default-features = false, features = ["webgpu", "webgl", "wgsl", "naga-ir", "fragile-send-sync-non-atomic-wasm"] }
+diff --git a/crates/horizon-client/src/discord_presence.rs b/crates/horizon-client/src/discord_presence.rs
+index 3f6e929..c20e3ac 100644
+--- a/crates/horizon-client/src/discord_presence.rs
++++ b/crates/horizon-client/src/discord_presence.rs
+@@ -430,6 +430,11 @@ fn open(path: &std::path::Path) -> io::Result<Box<dyn Pipe>> {
+     Ok(Box::new(stream))
+ }
+ 
++/// Browser build: no Discord IPC pipe.
++#[cfg(not(any(unix, windows)))]
++fn open(_: &std::path::Path) -> io::Result<Box<dyn Pipe>> {
++    Err(io::Error::new(io::ErrorKind::Unsupported, "no Discord pipe in the browser"))
++}
+ #[cfg(windows)]
+ fn open(path: &std::path::Path) -> io::Result<Box<dyn Pipe>> {
+     let pipe = std::fs::OpenOptions::new()
+diff --git a/crates/horizon-client/src/game/event_loop.rs b/crates/horizon-client/src/game/event_loop.rs
+index 0323997..5b69274 100644
+--- a/crates/horizon-client/src/game/event_loop.rs
++++ b/crates/horizon-client/src/game/event_loop.rs
+@@ -8,6 +8,33 @@
+ use std::time::{Duration, Instant};
+ use winit::event_loop::{ActiveEventLoop, ControlFlow};
+ 
++/// winit's clock: `web_time::Instant` in the browser, `std::time::Instant` elsewhere.
++#[cfg(target_arch = "wasm32")]
++pub(crate) type WinitInstant = web_time::Instant;
++#[cfg(not(target_arch = "wasm32"))]
++pub(crate) type WinitInstant = Instant;
++
++/// The game's `Instant` on winit's clock.
++#[cfg(target_arch = "wasm32")]
++pub(crate) fn to_winit(at: Instant) -> WinitInstant {
++    let (now, w) = (Instant::now(), web_time::Instant::now());
++    if at >= now { w + (at - now) } else { w.checked_sub(now - at).unwrap_or(w) }
++}
++#[cfg(not(target_arch = "wasm32"))]
++pub(crate) fn to_winit(at: Instant) -> WinitInstant {
++    at
++}
++/// winit's `Instant` on the game's clock.
++#[cfg(target_arch = "wasm32")]
++pub(crate) fn from_winit(at: WinitInstant) -> Instant {
++    let (now, w) = (Instant::now(), web_time::Instant::now());
++    if at >= w { now + (at - w) } else { now.checked_sub(w - at).unwrap_or(now) }
++}
++#[cfg(not(target_arch = "wasm32"))]
++pub(crate) fn from_winit(at: WinitInstant) -> Instant {
++    at
++}
++
+ /// A successful frame only permits polling until the next idle iteration. If
+ /// the compositor stops delivering redraws, the old result must not keep the
+ /// loop spinning indefinitely. Offscreen frames are driven by the loop itself.
+@@ -16,7 +43,7 @@ pub(super) fn redraw_flow(frame_drawn: &mut bool, offscreen: bool, now: Instant)
+     if offscreen || drew_frame {
+         ControlFlow::Poll
+     } else {
+-        ControlFlow::WaitUntil(now + Duration::from_millis(16))
++        ControlFlow::WaitUntil(to_winit(now + Duration::from_millis(16)))
+     }
+ }
+ 
+@@ -47,7 +74,7 @@ mod tests {
+         assert_eq!(redraw_flow(&mut frame_drawn, false, now), ControlFlow::Poll);
+         assert_eq!(
+             redraw_flow(&mut frame_drawn, false, now),
+-            ControlFlow::WaitUntil(now + Duration::from_millis(16))
++            ControlFlow::WaitUntil(to_winit(now + Duration::from_millis(16)))
+         );
+         frame_drawn = true;
+         assert_eq!(redraw_flow(&mut frame_drawn, false, now), ControlFlow::Poll);
+diff --git a/crates/horizon-client/src/game/headless.rs b/crates/horizon-client/src/game/headless.rs
+index 587bd9b..4a7c6cf 100644
+--- a/crates/horizon-client/src/game/headless.rs
++++ b/crates/horizon-client/src/game/headless.rs
+@@ -39,7 +39,7 @@ impl HeadlessLoop {
+     /// for (`WaitUntil`, as the closing save's polls do), else one frame later.
+     fn next_step(&self, started: Instant) -> Instant {
+         match self.flow.get() {
+-            ControlFlow::WaitUntil(at) => at,
++            ControlFlow::WaitUntil(at) => super::event_loop::from_winit(at),
+             ControlFlow::Poll | ControlFlow::Wait => started + FRAME,
+         }
+     }
+diff --git a/crates/horizon-client/src/game/no_resources.rs b/crates/horizon-client/src/game/no_resources.rs
+index f97ce36..f3f76c4 100644
+--- a/crates/horizon-client/src/game/no_resources.rs
++++ b/crates/horizon-client/src/game/no_resources.rs
+@@ -164,7 +164,7 @@ impl ApplicationHandler for Missing {
+         }
+         // Wake now and then for Ctrl+C in the console; redraws come with events.
+         event_loop.set_control_flow(ControlFlow::WaitUntil(
+-            Instant::now() + Duration::from_millis(250),
++            super::event_loop::to_winit(Instant::now() + Duration::from_millis(250)),
+         ));
+     }
+ }
+diff --git a/crates/horizon-client/src/game/window_handler.rs b/crates/horizon-client/src/game/window_handler.rs
+index 5158287..2efdf6e 100644
+--- a/crates/horizon-client/src/game/window_handler.rs
++++ b/crates/horizon-client/src/game/window_handler.rs
+@@ -182,7 +182,7 @@ impl Game<'_> {
+                     }
+                     // Yield between polls even when disk I/O is slow.
+                     event_loop.set_control_flow(ControlFlow::WaitUntil(
+-                        Instant::now() + Duration::from_millis(4),
++                        super::event_loop::to_winit(Instant::now() + Duration::from_millis(4)),
+                     ));
+                 }
+                 Err(error) => {
+diff --git a/crates/horizon-client/src/save.rs b/crates/horizon-client/src/save.rs
+index b29e5b6..b9ddd79 100644
+--- a/crates/horizon-client/src/save.rs
++++ b/crates/horizon-client/src/save.rs
+@@ -276,6 +276,9 @@ pub const LOW_DISK_SPACE: u64 = 67_108_864;
+ /// `LevelStorageAccess.estimateDiskSpace`: the usable bytes of the disk holding `dir`
+ /// (`FileStore.getUsableSpace`), `u64::MAX` when it cannot be asked.
+ pub fn estimate_disk_space(dir: &Path) -> u64 {
++    #[cfg(target_arch = "wasm32")]
++    return { let _ = dir; u64::MAX };
++    #[cfg(not(target_arch = "wasm32"))]
+     fs4::available_space(dir).unwrap_or(u64::MAX)
+ }
+ /// `LevelStorageAccess.checkForLowDiskSpace`.
+diff --git a/crates/horizon-dualsense/Cargo.toml b/crates/horizon-dualsense/Cargo.toml
+index 9574e40..5944465 100644
+--- a/crates/horizon-dualsense/Cargo.toml
++++ b/crates/horizon-dualsense/Cargo.toml
+@@ -12,7 +12,7 @@ log = "0.4"
+ # hidapi has no iOS backend and its build script stops there, so the output's two
+ # dependencies go only to the targets that have one. On iOS the crate builds without
+ # output: the Link never opens.
+-[target.'cfg(not(target_os = "ios"))'.dependencies]
++[target.'cfg(not(any(target_os = "ios", target_arch = "wasm32")))'.dependencies]
+ # MIT; bundles the C hidapi under its BSD licence option. hidraw on Linux (libudev, as gilrs),
+ # IOKit on macOS (opened shared, so gilrs keeps reading the pad), the HID API on Windows.
+ hidapi = { version = "2.6.7", default-features = false, features = ["linux-static-hidraw", "macos-shared-device"] }
+diff --git a/crates/horizon-dualsense/src/device.rs b/crates/horizon-dualsense/src/device.rs
+index a59857f..aee3220 100644
+--- a/crates/horizon-dualsense/src/device.rs
++++ b/crates/horizon-dualsense/src/device.rs
+@@ -1,20 +1,20 @@
+ //! The pad over hidapi, and the thread that writes to it: writes block (a Bluetooth report can
+ //! take milliseconds), so the game only hands over what the pad should do.
+-#[cfg(not(target_os = "ios"))]
++#[cfg(not(any(target_os = "ios", target_arch = "wasm32")))]
+ use crate::{DEFAULT_LIGHTBAR, Output, PLAYER_1, Vibration, is_dualsense};
+ use crate::{TRIGGER_OFF, TriggerEffect};
+-#[cfg(not(target_os = "ios"))]
++#[cfg(not(any(target_os = "ios", target_arch = "wasm32")))]
+ use hidapi::{BusType, HidApi, HidDevice, HidResult};
+ use std::sync::Arc;
+-#[cfg(not(target_os = "ios"))]
++#[cfg(not(any(target_os = "ios", target_arch = "wasm32")))]
+ use std::sync::atomic::AtomicBool;
+ use std::sync::atomic::{AtomicU8, Ordering};
+ use std::sync::mpsc::Sender;
+-#[cfg(not(target_os = "ios"))]
++#[cfg(not(any(target_os = "ios", target_arch = "wasm32")))]
+ use std::sync::mpsc::{self, RecvTimeoutError};
+ use std::thread::JoinHandle;
+ use std::time::Duration;
+-#[cfg(not(target_os = "ios"))]
++#[cfg(not(any(target_os = "ios", target_arch = "wasm32")))]
+ use std::time::Instant;
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+@@ -24,7 +24,7 @@ pub enum Transport {
+ }
+ 
+ /// An open DualSense.
+-#[cfg(not(target_os = "ios"))]
++#[cfg(not(any(target_os = "ios", target_arch = "wasm32")))]
+ pub struct DualSense {
+     device: HidDevice,
+     transport: Transport,
+@@ -42,7 +42,7 @@ pub fn bluetooth_allowed() -> bool {
+     cfg!(target_os = "linux") || std::env::var_os("HORIZON_DUALSENSE_BT").is_some_and(|v| v == "1")
+ }
+ 
+-#[cfg(not(target_os = "ios"))]
++#[cfg(not(any(target_os = "ios", target_arch = "wasm32")))]
+ impl DualSense {
+     /// The first DualSense hidapi lists, USB before Bluetooth (as SDL); `None` when there is
+     /// none, an error when it can't be opened (Linux without access to its hidraw node).
+@@ -130,7 +130,7 @@ pub type Rumble = Vec<([u8; 2], Duration)>;
+ 
+ // On iOS no thread reads the queue (the Link never opens); the variants stay so the
+ // Link's API is the same everywhere.
+-#[cfg_attr(target_os = "ios", allow(dead_code))]
++#[cfg_attr(any(target_os = "ios", target_arch = "wasm32"), allow(dead_code))]
+ enum Message {
+     State(State),
+     Rumble(Rumble),
+@@ -148,7 +148,7 @@ pub struct Link {
+ 
+ impl Link {
+     /// Start the thread and look for a DualSense.
+-    #[cfg(not(target_os = "ios"))]
++    #[cfg(not(any(target_os = "ios", target_arch = "wasm32")))]
+     pub fn start() -> Link {
+         let (tx, rx) = mpsc::channel();
+         let open = Arc::new(AtomicU8::new(0));
+@@ -166,7 +166,7 @@ impl Link {
+     }
+ 
+     /// No output on iOS: hidapi has no backend there. The Link never opens.
+-    #[cfg(target_os = "ios")]
++    #[cfg(any(target_os = "ios", target_arch = "wasm32"))]
+     pub fn start() -> Link {
+         Link {
+             tx: None,
+@@ -218,10 +218,10 @@ impl Drop for Link {
+ 
+ /// Looks for the pad this many more times, a second apart, after a scan finds nothing (its
+ /// hidraw node may appear after the controller does).
+-#[cfg(not(target_os = "ios"))]
++#[cfg(not(any(target_os = "ios", target_arch = "wasm32")))]
+ const SCAN_TRIES: u32 = 5;
+ 
+-#[cfg(not(target_os = "ios"))]
++#[cfg(not(any(target_os = "ios", target_arch = "wasm32")))]
+ struct Writer {
+     api: Option<HidApi>,
+     pad: Option<Box<dyn Handle>>,
+@@ -239,7 +239,7 @@ struct Writer {
+     next_scan: Instant,
+ }
+ 
+-#[cfg(not(target_os = "ios"))]
++#[cfg(not(any(target_os = "ios", target_arch = "wasm32")))]
+ #[derive(Clone, Copy, Debug, PartialEq)]
+ enum Lights {
+     /// Over Bluetooth, until the pad's clock says its animation is over (or this long after
+@@ -252,13 +252,13 @@ enum Lights {
+ 
+ /// The pad's sensor clock once its Bluetooth connection animation is over (SDL_hidapi_ps5.c's
+ /// `HIDAPI_DriverPS5_CheckPendingLEDReset`).
+-#[cfg(not(target_os = "ios"))]
++#[cfg(not(any(target_os = "ios", target_arch = "wasm32")))]
+ const ANIMATION_OVER: u32 = 10_200_000;
+ 
+ /// The sensor clock of a Bluetooth input report 0x31: its state block starts at byte 2 and
+ /// holds the clock at 27..31, little-endian (SDL's `PS5StatePacketCommon_t`, the kernel's
+ /// `dualsense_input_report`).
+-#[cfg(not(target_os = "ios"))]
++#[cfg(not(any(target_os = "ios", target_arch = "wasm32")))]
+ fn bluetooth_clock(report: &[u8]) -> Option<u32> {
+     match report {
+         [0x31, _, state @ ..] if state.len() >= 31 => {
+@@ -271,13 +271,13 @@ fn bluetooth_clock(report: &[u8]) -> Option<u32> {
+ /// What the writer needs from an open pad. It is a trait so the state machine can be tested
+ /// without hardware: hidapi's Windows back end can crash inside `hid_write` once the device is
+ /// gone, so every failure has to drop the handle.
+-#[cfg(not(target_os = "ios"))]
++#[cfg(not(any(target_os = "ios", target_arch = "wasm32")))]
+ trait Handle: Send {
+     fn write(&mut self, out: &Output) -> HidResult<()>;
+     fn read(&self, buf: &mut [u8], millis: i32) -> HidResult<usize>;
+ }
+ 
+-#[cfg(not(target_os = "ios"))]
++#[cfg(not(any(target_os = "ios", target_arch = "wasm32")))]
+ impl Handle for DualSense {
+     fn write(&mut self, out: &Output) -> HidResult<()> {
+         DualSense::write(self, out)
+@@ -288,7 +288,7 @@ impl Handle for DualSense {
+     }
+ }
+ 
+-#[cfg(not(target_os = "ios"))]
++#[cfg(not(any(target_os = "ios", target_arch = "wasm32")))]
+ impl Writer {
+     fn new(open: Arc<AtomicU8>) -> Self {
+         Writer {
+diff --git a/crates/horizon-dualsense/src/lib.rs b/crates/horizon-dualsense/src/lib.rs
+index 4ae55de..ca00e4e 100644
+--- a/crates/horizon-dualsense/src/lib.rs
++++ b/crates/horizon-dualsense/src/lib.rs
+@@ -8,9 +8,9 @@
+ //! and as report 0x31 over Bluetooth, where a sequence tag leads it and a CRC-32 (seeded with
+ //! the byte 0xA2) closes it.
+ pub mod device;
+-#[cfg(not(target_os = "ios"))]
++#[cfg(not(any(target_os = "ios", target_arch = "wasm32")))]
+ pub mod haptics;
+-#[cfg(target_os = "ios")]
++#[cfg(any(target_os = "ios", target_arch = "wasm32"))]
+ #[path = "haptics_stub.rs"]
+ pub mod haptics;
+ pub mod trigger;
+diff --git a/crates/horizon-friends/Cargo.toml b/crates/horizon-friends/Cargo.toml
+index a3885dc..8ef8866 100644
+--- a/crates/horizon-friends/Cargo.toml
++++ b/crates/horizon-friends/Cargo.toml
+@@ -19,7 +19,6 @@ getrandom = "0.3"
+ # SO_REUSEADDR/SO_REUSEPORT for the direct socket (TCP simultaneous open).
+ socket2 = { version = "0.6", features = ["all"] }
+ # This machine's addresses (LAN, VPNs such as Tailscale or ZeroTier, IPv6) for the code.
+-if-addrs = "0.15"
+ serde = { version = "1", features = ["derive"] }
+ serde_json = "1.0.151"
+ 
+@@ -30,3 +29,6 @@ game = ["dep:horizon-platform"]
+ 
+ [lints]
+ workspace = true
++
++[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
++if-addrs = "0.15"
+diff --git a/crates/horizon-friends/src/reach.rs b/crates/horizon-friends/src/reach.rs
+index 712358d..f5d7e04 100644
+--- a/crates/horizon-friends/src/reach.rs
++++ b/crates/horizon-friends/src/reach.rs
+@@ -67,7 +67,11 @@ fn virtual_interface(name: &str) -> bool {
+ /// IPv6. No link-local or unique-local; loopback on request.
+ pub fn interface_addresses(loopback: bool) -> Vec<IpAddr> {
+     let mut found: Vec<(u8, IpAddr)> = Vec::new();
+-    for i in if_addrs::get_if_addrs().unwrap_or_default() {
++    #[cfg(target_arch = "wasm32")]
++    let interfaces: Vec<web_if::Interface> = Vec::new();
++    #[cfg(not(target_arch = "wasm32"))]
++    let interfaces = if_addrs::get_if_addrs().unwrap_or_default();
++    for i in interfaces {
+         if virtual_interface(&i.name) {
+             continue;
+         }
+@@ -358,3 +362,17 @@ mod tests {
+         assert!(interface_addresses(true).contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
+     }
+ }
++
++/// Browser build: no network interfaces to list.
++#[cfg(target_arch = "wasm32")]
++mod web_if {
++    pub struct Interface {
++        pub name: String,
++        ip: std::net::IpAddr,
++    }
++    impl Interface {
++        pub fn ip(&self) -> std::net::IpAddr {
++            self.ip
++        }
++    }
++}
+diff --git a/crates/horizon-hdr/src/lib.rs b/crates/horizon-hdr/src/lib.rs
+index 4c35972..ea2abb5 100644
+--- a/crates/horizon-hdr/src/lib.rs
++++ b/crates/horizon-hdr/src/lib.rs
+@@ -9,7 +9,7 @@ pub mod wayland;
+ /// Opens a Vulkan device with `VK_EXT_hdr_metadata` too, when the GPU offers
+ /// it, so [`set_metadata`] can tell the compositor the real peak brightness.
+ /// `None` leaves opening to wgpu.
+-#[cfg(not(target_os = "macos"))]
++#[cfg(not(any(target_os = "macos", target_arch = "wasm32")))]
+ pub fn open_vulkan_device(
+     adapter: &wgpu::Adapter,
+     desc: &wgpu::DeviceDescriptor<'_>,
+@@ -47,6 +47,15 @@ pub fn open_vulkan_device(
+     Some(unsafe { adapter.create_device_from_hal(open, desc) })
+ }
+ 
++/// Browser build: no Vulkan, wgpu opens the device itself.
++#[cfg(target_arch = "wasm32")]
++pub fn open_vulkan_device(
++    _: &wgpu::Adapter,
++    _: &wgpu::DeviceDescriptor<'_>,
++) -> Option<Result<(wgpu::Device, wgpu::Queue), wgpu::RequestDeviceError>> {
++    None
++}
++
+ /// wgpu's opt-in to its `EXPERIMENTAL_*` features, which the crates that forbid unsafe code
+ /// can't give: hardware ray queries, asked for only when the player turns ray tracing on
+ /// (`gfx/ray_query.rs` in horizon-client-render).
+@@ -60,7 +69,7 @@ pub fn experimental_features() -> wgpu::ExperimentalFeatures {
+ /// content is BT.709, peaks at `peak` nits and is no darker than `black`. Needs a
+ /// device from `open_vulkan_device` and a configured surface; does nothing otherwise.
+ pub fn set_metadata(device: &wgpu::Device, surface: &wgpu::Surface<'_>, peak: f32, black: f32) {
+-    #[cfg(not(target_os = "macos"))]
++    #[cfg(not(any(target_os = "macos", target_arch = "wasm32")))]
+     {
+         use wgpu::hal::api::Vulkan;
+         // Safety: read-only access to handles wgpu keeps alive while these guards live.
+@@ -91,7 +100,7 @@ pub fn set_metadata(device: &wgpu::Device, surface: &wgpu::Surface<'_>, peak: f3
+     let _ = (device, surface, peak, black);
+ }
+ 
+-#[cfg(not(target_os = "macos"))]
++#[cfg(not(any(target_os = "macos", target_arch = "wasm32")))]
+ fn metadata(peak: f32, black: f32) -> ash::vk::HdrMetadataEXT<'static> {
+     let xy = |x, y| ash::vk::XYColorEXT { x, y };
+     ash::vk::HdrMetadataEXT::default()
+diff --git a/crates/horizon-threads/Cargo.toml b/crates/horizon-threads/Cargo.toml
+index fc2356f..9474dcc 100644
+--- a/crates/horizon-threads/Cargo.toml
++++ b/crates/horizon-threads/Cargo.toml
+@@ -7,6 +7,8 @@ rust-version.workspace = true
+ description = "Scheduling hints for the game's threads and its allocator, and the other OS calls the crates that forbid unsafe code can't make"
+ 
+ [dependencies]
++
++[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ mimalloc = { version = "0.1.52", default-features = false }
+ libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended"] }
+ 
+diff --git a/crates/horizon-threads/src/heap_census.rs b/crates/horizon-threads/src/heap_census.rs
+index ddb84b7..d685457 100644
+--- a/crates/horizon-threads/src/heap_census.rs
++++ b/crates/horizon-threads/src/heap_census.rs
+@@ -183,9 +183,9 @@ pub fn census() -> Vec<(&'static str, isize)> {
+     by_name
+ }
+ 
+-#[cfg(not(miri))]
++#[cfg(not(any(miri, target_arch = "wasm32")))]
+ use mimalloc::MiMalloc as BackingAlloc;
+-#[cfg(miri)]
++#[cfg(any(miri, target_arch = "wasm32"))]
+ use std::alloc::System as BackingAlloc;
+ 
+ /// mimalloc with a tag in front of each block (see the module).
+diff --git a/crates/horizon-threads/src/lib.rs b/crates/horizon-threads/src/lib.rs
+index e2a36c0..3b4c138 100644
+--- a/crates/horizon-threads/src/lib.rs
++++ b/crates/horizon-threads/src/lib.rs
+@@ -469,9 +469,16 @@ pub fn catch_stop_signals() {}
+ /// World generation, meshing and the tick allocate and free small blocks on
+ /// every worker at once; the system heaps serialise them (Windows' heap was
+ /// 16% of a chunk's generation time), mimalloc keeps a heap per thread.
++#[cfg(not(target_arch = "wasm32"))]
+ pub type Allocator = mimalloc::MiMalloc;
+ /// The game's mimalloc allocator.
++#[cfg(not(target_arch = "wasm32"))]
+ pub const ALLOCATOR: Allocator = mimalloc::MiMalloc;
++/// Browser build: the system allocator (dlmalloc in wasm32).
++#[cfg(target_arch = "wasm32")]
++pub type Allocator = std::alloc::System;
++#[cfg(target_arch = "wasm32")]
++pub const ALLOCATOR: Allocator = std::alloc::System;
+ 
+ /// The global allocator of a build with the `alloc-census` feature: live
+ /// heap bytes by startup step and thread, for `horizon-ctl memory`.
+@@ -487,6 +494,7 @@ pub fn heap_tag(name: &'static str) -> Option<heap_census::Tag> {
+ 
+ /// `mi_option_purge_delay` in mimalloc.h (index 15 in v2 and v3); the bindings
+ /// don't name it.
++#[cfg(not(target_arch = "wasm32"))]
+ const PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+ 
+ /// Set the allocator up, first thing in `main`: free pages go back to the OS
+@@ -495,6 +503,7 @@ const PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+ /// and generation keeps most of its speed-up.
+ pub fn configure_allocator() {
+     // SAFETY: sets one integer option, which mimalloc reads at each purge.
++    #[cfg(not(target_arch = "wasm32"))]
+     unsafe {
+         libmimalloc_sys::mi_option_set(PURGE_DELAY, 0);
+     }
+@@ -514,7 +523,10 @@ pub fn allocator_commit() -> (usize, usize) {
+         peak_commit,
+         faults,
+     ] = &mut info;
++    #[cfg(target_arch = "wasm32")]
++    return (0, 0);
+     // SAFETY: writes eight integers through pointers to them.
++    #[cfg(not(target_arch = "wasm32"))]
+     unsafe {
+         libmimalloc_sys::mi_process_info(
+             elapsed,
+@@ -536,6 +548,7 @@ pub fn allocator_commit() -> (usize, usize) {
+ /// thread that allocated them, and macOS in its zones until memory runs short.
+ pub fn release_free_memory() {
+     // SAFETY: frees only pages no allocation uses (this thread's heap, shared arenas).
++    #[cfg(not(target_arch = "wasm32"))]
+     unsafe {
+         libmimalloc_sys::mi_collect(true);
+     }
+diff --git a/web/stubs/mio/Cargo.toml b/web/stubs/mio/Cargo.toml
+new file mode 100644
+index 0000000..629f4a3
+--- /dev/null
++++ b/web/stubs/mio/Cargo.toml
+@@ -0,0 +1,11 @@
++[package]
++name = "mio"
++version = "1.2.4"
++edition = "2021"
++description = "Stub mio for wasm32: Poll never reports events, sockets can't exist."
++license = "MIT"
++
++[features]
++os-poll = []
++net = []
++os-ext = []
+diff --git a/web/stubs/mio/src/lib.rs b/web/stubs/mio/src/lib.rs
+new file mode 100644
+index 0000000..ed645b3
+--- /dev/null
++++ b/web/stubs/mio/src/lib.rs
+@@ -0,0 +1,101 @@
++//! Browser build: no OS sockets, so Poll has nothing to wait on.
++use std::io;
++use std::time::Duration;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub struct Token(pub usize);
++impl From<Token> for usize { fn from(t: Token) -> usize { t.0 } }
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Interest(u8);
++impl Interest {
++    pub const READABLE: Interest = Interest(1);
++    pub const WRITABLE: Interest = Interest(2);
++    pub const fn add(self, o: Interest) -> Interest { Interest(self.0 | o.0) }
++    pub const fn is_readable(self) -> bool { self.0 & 1 != 0 }
++    pub const fn is_writable(self) -> bool { self.0 & 2 != 0 }
++}
++impl std::ops::BitOr for Interest { type Output = Interest; fn bitor(self, o: Interest) -> Interest { self.add(o) } }
++
++pub mod event {
++    use super::*;
++    #[derive(Debug)]
++    pub struct Event(Token);
++    impl Event {
++        pub fn token(&self) -> Token { self.0 }
++        pub fn is_readable(&self) -> bool { false }
++        pub fn is_writable(&self) -> bool { false }
++        pub fn is_error(&self) -> bool { false }
++        pub fn is_read_closed(&self) -> bool { false }
++        pub fn is_write_closed(&self) -> bool { false }
++    }
++    pub trait Source {}
++    impl Source for crate::net::TcpStream {}
++}
++pub use event::Event;
++
++#[derive(Debug, Default)]
++pub struct Events(Vec<Event>);
++impl Events {
++    pub fn with_capacity(_: usize) -> Events { Events(Vec::new()) }
++    pub fn iter(&self) -> std::slice::Iter<'_, Event> { self.0.iter() }
++    pub fn is_empty(&self) -> bool { true }
++    pub fn clear(&mut self) {}
++}
++impl<'a> IntoIterator for &'a Events {
++    type Item = &'a Event;
++    type IntoIter = std::slice::Iter<'a, Event>;
++    fn into_iter(self) -> Self::IntoIter { self.0.iter() }
++}
++
++#[derive(Debug)]
++pub struct Registry(());
++impl Registry {
++    pub fn register<S: event::Source + ?Sized>(&self, _: &mut S, _: Token, _: Interest) -> io::Result<()> { Ok(()) }
++    pub fn reregister<S: event::Source + ?Sized>(&self, _: &mut S, _: Token, _: Interest) -> io::Result<()> { Ok(()) }
++    pub fn deregister<S: event::Source + ?Sized>(&self, _: &mut S) -> io::Result<()> { Ok(()) }
++    pub fn try_clone(&self) -> io::Result<Registry> { Ok(Registry(())) }
++}
++
++#[derive(Debug)]
++pub struct Poll(Registry);
++impl Poll {
++    pub fn new() -> io::Result<Poll> { Ok(Poll(Registry(()))) }
++    pub fn registry(&self) -> &Registry { &self.0 }
++    /// Nothing can become ready; sleeps for the timeout like a real poll would.
++    pub fn poll(&mut self, events: &mut Events, timeout: Option<Duration>) -> io::Result<()> {
++        events.clear();
++        std::thread::sleep(timeout.unwrap_or(Duration::from_millis(50)).min(Duration::from_millis(50)));
++        Ok(())
++    }
++}
++
++#[derive(Debug)]
++pub struct Waker(());
++impl Waker {
++    pub fn new(_: &Registry, _: Token) -> io::Result<Waker> { Ok(Waker(())) }
++    pub fn wake(&self) -> io::Result<()> { Ok(()) }
++}
++
++pub mod net {
++    use std::io;
++    /// Never constructed in the browser: no std TcpStream can be opened there.
++    #[derive(Debug)]
++    pub struct TcpStream(std::net::TcpStream);
++    impl TcpStream {
++        pub fn from_std(s: std::net::TcpStream) -> TcpStream { TcpStream(s) }
++        pub fn peer_addr(&self) -> io::Result<std::net::SocketAddr> { self.0.peer_addr() }
++        pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> { self.0.shutdown(how) }
++        pub fn set_nodelay(&self, v: bool) -> io::Result<()> { self.0.set_nodelay(v) }
++    }
++    impl io::Read for TcpStream { fn read(&mut self, b: &mut [u8]) -> io::Result<usize> { self.0.read(b) } }
++    impl io::Write for TcpStream {
++        fn write(&mut self, b: &[u8]) -> io::Result<usize> { self.0.write(b) }
++        fn flush(&mut self) -> io::Result<()> { self.0.flush() }
++    }
++    impl io::Read for &TcpStream { fn read(&mut self, b: &mut [u8]) -> io::Result<usize> { (&self.0).read(b) } }
++    impl io::Write for &TcpStream {
++        fn write(&mut self, b: &[u8]) -> io::Result<usize> { (&self.0).write(b) }
++        fn flush(&mut self) -> io::Result<()> { (&self.0).flush() }
++    }
++}
+diff --git a/web/stubs/socket2-0.5.10/Cargo.toml b/web/stubs/socket2-0.5.10/Cargo.toml
+new file mode 100644
+index 0000000..f19e9eb
+--- /dev/null
++++ b/web/stubs/socket2-0.5.10/Cargo.toml
+@@ -0,0 +1,9 @@
++[package]
++name = "socket2"
++version = "0.5.10"
++edition = "2021"
++description = "Stub socket2 for wasm32: types exist, every socket call fails with Unsupported."
++license = "MIT"
++
++[features]
++all = []
+diff --git a/web/stubs/socket2-0.5.10/src/lib.rs b/web/stubs/socket2-0.5.10/src/lib.rs
+new file mode 100644
+index 0000000..c632583
+--- /dev/null
++++ b/web/stubs/socket2-0.5.10/src/lib.rs
+@@ -0,0 +1,69 @@
++//! Browser build: no raw sockets. Everything returns io::ErrorKind::Unsupported.
++use std::io;
++use std::net::{SocketAddr, TcpListener, TcpStream};
++use std::time::Duration;
++
++fn no<T>() -> io::Result<T> {
++    Err(io::Error::new(io::ErrorKind::Unsupported, "sockets are not available in the browser build"))
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Domain(i32);
++impl Domain {
++    pub const IPV4: Domain = Domain(2);
++    pub const IPV6: Domain = Domain(10);
++    pub fn for_address(a: SocketAddr) -> Domain { if a.is_ipv6() { Self::IPV6 } else { Self::IPV4 } }
++}
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Type(i32);
++impl Type {
++    pub const STREAM: Type = Type(1);
++    pub const DGRAM: Type = Type(2);
++}
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Protocol(i32);
++impl Protocol {
++    pub const TCP: Protocol = Protocol(6);
++    pub const UDP: Protocol = Protocol(17);
++}
++#[derive(Clone, Debug)]
++pub struct SockAddr(SocketAddr);
++impl From<SocketAddr> for SockAddr { fn from(a: SocketAddr) -> Self { SockAddr(a) } }
++impl SockAddr { pub fn as_socket(&self) -> Option<SocketAddr> { Some(self.0) } }
++
++#[derive(Clone, Debug, Default)]
++pub struct TcpKeepalive;
++impl TcpKeepalive {
++    pub const fn new() -> Self { TcpKeepalive }
++    pub const fn with_time(self, _: Duration) -> Self { self }
++    pub const fn with_interval(self, _: Duration) -> Self { self }
++    pub const fn with_retries(self, _: u32) -> Self { self }
++}
++
++#[derive(Debug)]
++pub struct Socket(());
++impl Socket {
++    pub fn new(_: Domain, _: Type, _: Option<Protocol>) -> io::Result<Socket> { no() }
++    pub fn bind(&self, _: &SockAddr) -> io::Result<()> { no() }
++    pub fn listen(&self, _: i32) -> io::Result<()> { no() }
++    pub fn connect(&self, _: &SockAddr) -> io::Result<()> { no() }
++    pub fn connect_timeout(&self, _: &SockAddr, _: Duration) -> io::Result<()> { no() }
++    pub fn set_nonblocking(&self, _: bool) -> io::Result<()> { no() }
++    pub fn set_reuse_address(&self, _: bool) -> io::Result<()> { no() }
++    pub fn set_reuse_port(&self, _: bool) -> io::Result<()> { no() }
++    pub fn set_only_v6(&self, _: bool) -> io::Result<()> { no() }
++    pub fn set_nodelay(&self, _: bool) -> io::Result<()> { no() }
++    pub fn set_tcp_keepalive(&self, _: &TcpKeepalive) -> io::Result<()> { no() }
++    pub fn local_addr(&self) -> io::Result<SockAddr> { no() }
++}
++impl From<Socket> for TcpStream { fn from(_: Socket) -> TcpStream { unreachable!("no sockets in the browser build") } }
++impl From<Socket> for TcpListener { fn from(_: Socket) -> TcpListener { unreachable!("no sockets in the browser build") } }
++
++pub struct SockRef<'a>(std::marker::PhantomData<&'a ()>);
++impl<'a> From<&'a TcpStream> for SockRef<'a> { fn from(_: &'a TcpStream) -> Self { SockRef(std::marker::PhantomData) } }
++impl<'a> From<&'a TcpListener> for SockRef<'a> { fn from(_: &'a TcpListener) -> Self { SockRef(std::marker::PhantomData) } }
++impl SockRef<'_> {
++    pub fn set_tcp_keepalive(&self, _: &TcpKeepalive) -> io::Result<()> { Ok(()) }
++    pub fn set_quickack(&self, _: bool) -> io::Result<()> { Ok(()) }
++    pub fn set_nodelay(&self, _: bool) -> io::Result<()> { Ok(()) }
++}
+diff --git a/web/stubs/socket2-0.6.5/Cargo.toml b/web/stubs/socket2-0.6.5/Cargo.toml
+new file mode 100644
+index 0000000..f390b86
+--- /dev/null
++++ b/web/stubs/socket2-0.6.5/Cargo.toml
+@@ -0,0 +1,9 @@
++[package]
++name = "socket2"
++version = "0.6.5"
++edition = "2021"
++description = "Stub socket2 for wasm32: types exist, every socket call fails with Unsupported."
++license = "MIT"
++
++[features]
++all = []
+diff --git a/web/stubs/socket2-0.6.5/src/lib.rs b/web/stubs/socket2-0.6.5/src/lib.rs
+new file mode 100644
+index 0000000..c632583
+--- /dev/null
++++ b/web/stubs/socket2-0.6.5/src/lib.rs
+@@ -0,0 +1,69 @@
++//! Browser build: no raw sockets. Everything returns io::ErrorKind::Unsupported.
++use std::io;
++use std::net::{SocketAddr, TcpListener, TcpStream};
++use std::time::Duration;
++
++fn no<T>() -> io::Result<T> {
++    Err(io::Error::new(io::ErrorKind::Unsupported, "sockets are not available in the browser build"))
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Domain(i32);
++impl Domain {
++    pub const IPV4: Domain = Domain(2);
++    pub const IPV6: Domain = Domain(10);
++    pub fn for_address(a: SocketAddr) -> Domain { if a.is_ipv6() { Self::IPV6 } else { Self::IPV4 } }
++}
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Type(i32);
++impl Type {
++    pub const STREAM: Type = Type(1);
++    pub const DGRAM: Type = Type(2);
++}
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Protocol(i32);
++impl Protocol {
++    pub const TCP: Protocol = Protocol(6);
++    pub const UDP: Protocol = Protocol(17);
++}
++#[derive(Clone, Debug)]
++pub struct SockAddr(SocketAddr);
++impl From<SocketAddr> for SockAddr { fn from(a: SocketAddr) -> Self { SockAddr(a) } }
++impl SockAddr { pub fn as_socket(&self) -> Option<SocketAddr> { Some(self.0) } }
++
++#[derive(Clone, Debug, Default)]
++pub struct TcpKeepalive;
++impl TcpKeepalive {
++    pub const fn new() -> Self { TcpKeepalive }
++    pub const fn with_time(self, _: Duration) -> Self { self }
++    pub const fn with_interval(self, _: Duration) -> Self { self }
++    pub const fn with_retries(self, _: u32) -> Self { self }
++}
++
++#[derive(Debug)]
++pub struct Socket(());
++impl Socket {
++    pub fn new(_: Domain, _: Type, _: Option<Protocol>) -> io::Result<Socket> { no() }
++    pub fn bind(&self, _: &SockAddr) -> io::Result<()> { no() }
++    pub fn listen(&self, _: i32) -> io::Result<()> { no() }
++    pub fn connect(&self, _: &SockAddr) -> io::Result<()> { no() }
++    pub fn connect_timeout(&self, _: &SockAddr, _: Duration) -> io::Result<()> { no() }
++    pub fn set_nonblocking(&self, _: bool) -> io::Result<()> { no() }
++    pub fn set_reuse_address(&self, _: bool) -> io::Result<()> { no() }
++    pub fn set_reuse_port(&self, _: bool) -> io::Result<()> { no() }
++    pub fn set_only_v6(&self, _: bool) -> io::Result<()> { no() }
++    pub fn set_nodelay(&self, _: bool) -> io::Result<()> { no() }
++    pub fn set_tcp_keepalive(&self, _: &TcpKeepalive) -> io::Result<()> { no() }
++    pub fn local_addr(&self) -> io::Result<SockAddr> { no() }
++}
++impl From<Socket> for TcpStream { fn from(_: Socket) -> TcpStream { unreachable!("no sockets in the browser build") } }
++impl From<Socket> for TcpListener { fn from(_: Socket) -> TcpListener { unreachable!("no sockets in the browser build") } }
++
++pub struct SockRef<'a>(std::marker::PhantomData<&'a ()>);
++impl<'a> From<&'a TcpStream> for SockRef<'a> { fn from(_: &'a TcpStream) -> Self { SockRef(std::marker::PhantomData) } }
++impl<'a> From<&'a TcpListener> for SockRef<'a> { fn from(_: &'a TcpListener) -> Self { SockRef(std::marker::PhantomData) } }
++impl SockRef<'_> {
++    pub fn set_tcp_keepalive(&self, _: &TcpKeepalive) -> io::Result<()> { Ok(()) }
++    pub fn set_quickack(&self, _: bool) -> io::Result<()> { Ok(()) }
++    pub fn set_nodelay(&self, _: bool) -> io::Result<()> { Ok(()) }
++}
+diff --git a/web/stubs/ureq/Cargo.toml b/web/stubs/ureq/Cargo.toml
+new file mode 100644
+index 0000000..a5df89e
+--- /dev/null
++++ b/web/stubs/ureq/Cargo.toml
+@@ -0,0 +1,21 @@
++[package]
++name = "ureq"
++version = "2.12.1"
++edition = "2021"
++description = "Offline stub of ureq 2 for wasm32: same API, every request fails with a transport error."
++license = "MIT"
++
++[dependencies]
++serde = "1"
++serde_json = "1"
++
++[features]
++default = []
++tls = []
++json = []
++gzip = []
++brotli = []
++charset = []
++cookies = []
++socks-proxy = []
++native-tls = []
+diff --git a/web/stubs/ureq/src/lib.rs b/web/stubs/ureq/src/lib.rs
+new file mode 100644
+index 0000000..3b126d7
+--- /dev/null
++++ b/web/stubs/ureq/src/lib.rs
+@@ -0,0 +1,137 @@
++//! Offline ureq 2 for the browser build. Requests compile and fail at runtime with
++//! `Error::Transport`, which every caller already treats as "no connection".
++use std::fmt;
++use std::io::Read;
++use std::time::Duration;
++
++pub fn agent() -> Agent { Agent }
++pub fn get(path: &str) -> Request { Agent.get(path) }
++pub fn post(path: &str) -> Request { Agent.post(path) }
++pub fn put(path: &str) -> Request { Agent.put(path) }
++pub fn delete(path: &str) -> Request { Agent.delete(path) }
++pub fn head(path: &str) -> Request { Agent.head(path) }
++pub fn patch(path: &str) -> Request { Agent.patch(path) }
++pub fn request(method: &str, path: &str) -> Request { Agent.request(method, path) }
++
++#[derive(Clone, Debug, Default)]
++pub struct Agent;
++impl Agent {
++    pub fn new() -> Agent { Agent }
++    pub fn request(&self, method: &str, path: &str) -> Request {
++        Request { method: method.into(), url: path.into() }
++    }
++    pub fn get(&self, path: &str) -> Request { self.request("GET", path) }
++    pub fn post(&self, path: &str) -> Request { self.request("POST", path) }
++    pub fn put(&self, path: &str) -> Request { self.request("PUT", path) }
++    pub fn delete(&self, path: &str) -> Request { self.request("DELETE", path) }
++    pub fn head(&self, path: &str) -> Request { self.request("HEAD", path) }
++    pub fn patch(&self, path: &str) -> Request { self.request("PATCH", path) }
++}
++
++#[derive(Clone, Debug, Default)]
++pub struct AgentBuilder;
++impl AgentBuilder {
++    pub fn new() -> Self { AgentBuilder }
++    pub fn build(self) -> Agent { Agent }
++    pub fn timeout(self, _: Duration) -> Self { self }
++    pub fn timeout_connect(self, _: Duration) -> Self { self }
++    pub fn timeout_read(self, _: Duration) -> Self { self }
++    pub fn timeout_write(self, _: Duration) -> Self { self }
++    pub fn user_agent(self, _: &str) -> Self { self }
++    pub fn redirects(self, _: u32) -> Self { self }
++    pub fn proxy(self, _: Proxy) -> Self { self }
++    pub fn try_proxy_from_env(self, _: bool) -> Self { self }
++    pub fn max_idle_connections(self, _: usize) -> Self { self }
++    pub fn max_idle_connections_per_host(self, _: usize) -> Self { self }
++    pub fn no_delay(self, _: bool) -> Self { self }
++    pub fn https_only(self, _: bool) -> Self { self }
++}
++
++#[derive(Clone, Debug)]
++pub struct Proxy;
++impl Proxy {
++    pub fn new<S: AsRef<str>>(_: S) -> Result<Proxy, Error> { Ok(Proxy) }
++}
++
++#[derive(Clone, Debug)]
++pub struct Request {
++    method: String,
++    url: String,
++}
++impl Request {
++    fn fail(&self) -> Result<Response, Error> {
++        Err(Error::Transport(Transport { url: self.url.clone() }))
++    }
++    pub fn set(self, _: &str, _: &str) -> Self { self }
++    pub fn query(self, _: &str, _: &str) -> Self { self }
++    pub fn query_pairs<'a, P: IntoIterator<Item = (&'a str, &'a str)>>(self, _: P) -> Self { self }
++    pub fn timeout(self, _: Duration) -> Self { self }
++    pub fn method(&self) -> &str { &self.method }
++    pub fn url(&self) -> &str { &self.url }
++    pub fn header(&self, _: &str) -> Option<&str> { None }
++    pub fn call(self) -> Result<Response, Error> { self.fail() }
++    pub fn send(self, _: impl Read) -> Result<Response, Error> { self.fail() }
++    pub fn send_bytes(self, _: &[u8]) -> Result<Response, Error> { self.fail() }
++    pub fn send_string(self, _: &str) -> Result<Response, Error> { self.fail() }
++    pub fn send_json(self, _: impl serde::Serialize) -> Result<Response, Error> { self.fail() }
++    pub fn send_form(self, _: &[(&str, &str)]) -> Result<Response, Error> { self.fail() }
++}
++
++/// Never constructed: no request ever succeeds offline.
++#[derive(Debug)]
++pub struct Response {
++    status: u16,
++}
++impl Response {
++    pub fn status(&self) -> u16 { self.status }
++    pub fn status_text(&self) -> &str { "" }
++    pub fn get_url(&self) -> &str { "" }
++    pub fn header(&self, _: &str) -> Option<&str> { None }
++    pub fn headers_names(&self) -> Vec<String> { Vec::new() }
++    pub fn all(&self, _: &str) -> Vec<&str> { Vec::new() }
++    pub fn content_type(&self) -> &str { "" }
++    pub fn charset(&self) -> &str { "" }
++    pub fn into_reader(self) -> Box<dyn Read + Send + Sync + 'static> { Box::new(std::io::empty()) }
++    pub fn into_string(self) -> std::io::Result<String> { Ok(String::new()) }
++    pub fn into_json<T: serde::de::DeserializeOwned>(self) -> std::io::Result<T> {
++        serde_json::from_str("null").map_err(std::io::Error::other)
++    }
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum ErrorKind { InvalidUrl, UnknownScheme, Dns, InsecureRequestHttpsOnly, ConnectionFailed, TooManyRedirects, BadStatus, BadHeader, Io, InvalidProxyUrl, ProxyConnect, ProxyUnauthorized, HTTP }
++impl fmt::Display for ErrorKind {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("Network Error: offline (browser build)") }
++}
++
++#[derive(Debug)]
++pub struct Transport { url: String }
++impl Transport {
++    pub fn kind(&self) -> ErrorKind { ErrorKind::ConnectionFailed }
++    pub fn message(&self) -> Option<&str> { Some("offline (browser build)") }
++    pub fn url(&self) -> Option<&str> { Some(&self.url) }
++}
++impl fmt::Display for Transport {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{}: offline (browser build)", self.url) }
++}
++impl std::error::Error for Transport {}
++
++#[derive(Debug)]
++pub enum Error {
++    Status(u16, Response),
++    Transport(Transport),
++}
++impl Error {
++    pub fn kind(&self) -> ErrorKind { ErrorKind::ConnectionFailed }
++    pub fn into_response(self) -> Option<Response> { match self { Error::Status(_, r) => Some(r), _ => None } }
++    pub fn into_transport(self) -> Option<Transport> { match self { Error::Transport(t) => Some(t), _ => None } }
++}
++impl fmt::Display for Error {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self { Error::Status(c, _) => write!(f, "status {c}"), Error::Transport(t) => t.fmt(f) }
++    }
++}
++impl std::error::Error for Error {}
++impl From<Error> for std::io::Error {
++    fn from(e: Error) -> Self { std::io::Error::other(e.to_string()) }
++}
+-- 
+2.43.0
+

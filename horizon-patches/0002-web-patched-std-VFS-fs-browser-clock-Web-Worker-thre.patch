@@ -1,0 +1,1208 @@
+From 71facaeaf2cb242f5649ba53c828e6ad254146bc Mon Sep 17 00:00:00 2001
+From: Skittle <skittle@localhost>
+Date: Mon, 9 Nov 2026 21:45:19 +0100
+Subject: [PATCH 2/4] web: patched std (VFS fs, browser clock, Web Worker
+ threads) + JS runtime
+
+std for wasm32-unknown-unknown gets an in-memory filesystem shared by all threads,
+Instant/SystemTime from performance.now/Date.now, and std::thread::spawn on a pool of
+pre-started Workers (spawning works while the spawner blocks). Main thread spins instead
+of Atomics.wait. Verified in Chrome: fs, threads, join, sleep, clock.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013ctixKwuqeX8BmwPkfP33r
+---
+ web/runtime/fix_glue.py     |   8 +
+ web/runtime/hzweb.js        |  67 ++++
+ web/runtime/hzweb_worker.js |  25 ++
+ web/runtime/serve.py        |  13 +
+ web/std/apply.py            |  87 +++++
+ web/std/fs_hzweb.rs         | 730 ++++++++++++++++++++++++++++++++++++
+ web/std/os_hzweb.rs         |  38 ++
+ web/std/thread_hzweb.rs     |  94 +++++
+ web/std/time_hzweb.rs       |  55 +++
+ 9 files changed, 1117 insertions(+)
+ create mode 100644 web/runtime/fix_glue.py
+ create mode 100644 web/runtime/hzweb.js
+ create mode 100644 web/runtime/hzweb_worker.js
+ create mode 100644 web/runtime/serve.py
+ create mode 100644 web/std/apply.py
+ create mode 100644 web/std/fs_hzweb.rs
+ create mode 100644 web/std/os_hzweb.rs
+ create mode 100644 web/std/thread_hzweb.rs
+ create mode 100644 web/std/time_hzweb.rs
+
+diff --git a/web/runtime/fix_glue.py b/web/runtime/fix_glue.py
+new file mode 100644
+index 0000000..72152e8
+--- /dev/null
++++ b/web/runtime/fix_glue.py
+@@ -0,0 +1,8 @@
++#!/usr/bin/env python3
++"""Point wasm-bindgen's bare `from "hzweb"` imports at the runtime file next to the glue."""
++import sys, re
++p = sys.argv[1]
++s = open(p).read()
++s2 = s.replace('from "hzweb"', 'from "./hzweb.js"')
++open(p, 'w').write(s2)
++print(p, s.count('from "hzweb"'), 'imports rewritten')
+diff --git a/web/runtime/hzweb.js b/web/runtime/hzweb.js
+new file mode 100644
+index 0000000..659e888
+--- /dev/null
++++ b/web/runtime/hzweb.js
+@@ -0,0 +1,67 @@
++// Horizon web runtime: the "hzweb" imports of the patched std (clock, cores, threads).
++// Threads come from a pool of pre-started module Workers that wait on a shared slot: a
++// spawn claims an idle slot and wakes it with Atomics.notify, so spawning works even while
++// the spawning thread is blocked (a blocked thread can't start a Worker itself). The main
++// thread refills the pool as workers finish.
++const IS_MAIN = typeof document !== 'undefined';
++const FIELDS = 4; // state, arg, stack, spare
++// slot states
++const STARTING = 0, IDLE = 1, CLAIMED = 2, JOB = 3, RUNNING = 4, DONE = 5;
++let ctx = null; // { module, memory, glue, slots: Int32Array, count }
++
++export function hzwebSetContext(c) { ctx = c; }
++export function hzwebContext() { return ctx; }
++export function hz_now_ms() { return performance.timeOrigin + performance.now(); }
++export function hz_date_ms() { return Date.now(); }
++export function hz_cores() { return Math.max(2, Math.min(navigator.hardwareConcurrency || 4, 16)); }
++export function hz_is_main() { return IS_MAIN ? 1 : 0; }
++
++export function hz_spawn(arg, stack) {
++  if (!ctx || !ctx.slots) { console.error('hzweb: spawn before the thread pool started'); return 1; }
++  const s = ctx.slots, n = ctx.count;
++  const pages = Math.ceil(Math.max(stack, 1 << 20) / 65536) * 65536;
++  for (let round = 0; round < 2000; round++) {
++    for (let i = 0; i < n; i++) {
++      if (Atomics.compareExchange(s, i * FIELDS, IDLE, CLAIMED) === IDLE) {
++        s[i * FIELDS + 1] = arg;
++        s[i * FIELDS + 2] = pages;
++        Atomics.store(s, i * FIELDS, JOB);
++        Atomics.notify(s, i * FIELDS);
++        return 0;
++      }
++    }
++    // Every worker is busy: wait a moment for one to come back (not possible on main).
++    if (IS_MAIN) break;
++    Atomics.wait(s, n * FIELDS, 0, 5);
++  }
++  console.error(`hzweb: no idle thread among ${n}`);
++  return 1;
++}
++
++/** Main thread: start `count` pooled workers on `memory`, and refill slots as they finish. */
++export function hzwebStartPool({ module, memory, glue, count = 64 }) {
++  const slots = new Int32Array(new SharedArrayBuffer((count * FIELDS + 1) * 4));
++  ctx = { module, memory, glue, slots, count };
++  const start = (i) => {
++    Atomics.store(slots, i * FIELDS, STARTING);
++    const w = new Worker(new URL('./hzweb_worker.js', import.meta.url), { type: 'module', name: `hz-thread-${i}` });
++    w.onmessage = (e) => {
++      if (e.data === 'done') { w.terminate(); start(i); }
++    };
++    w.onerror = (e) => { console.error('hzweb thread worker', i, e.message || e); };
++    w.postMessage({ module, memory, glue, slots, count, index: i });
++  };
++  for (let i = 0; i < count; i++) start(i);
++  return ctx;
++}
++
++/** Resolves once every pooled worker is idle (ready to take a spawn). */
++export async function hzwebPoolReady() {
++  const { slots, count } = ctx;
++  for (;;) {
++    let ready = 0;
++    for (let i = 0; i < count; i++) if (Atomics.load(slots, i * FIELDS) !== STARTING) ready++;
++    if (ready === count) return;
++    await new Promise((r) => setTimeout(r, 20));
++  }
++}
+diff --git a/web/runtime/hzweb_worker.js b/web/runtime/hzweb_worker.js
+new file mode 100644
+index 0000000..9b22d08
+--- /dev/null
++++ b/web/runtime/hzweb_worker.js
+@@ -0,0 +1,25 @@
++// A pooled std::thread worker: load the glue, go idle, wait for a job, run it, report done.
++import { hzwebSetContext } from './hzweb.js';
++const FIELDS = 4, IDLE = 1, JOB = 3, RUNNING = 4, DONE = 5;
++self.onmessage = async (e) => {
++  const { module, memory, glue, slots, count, index } = e.data;
++  const m = await import(glue);
++  hzwebSetContext({ module, memory, glue, slots, count });
++  const at = index * FIELDS;
++  Atomics.store(slots, at, IDLE);
++  while (Atomics.load(slots, at) !== JOB) Atomics.wait(slots, at, Atomics.load(slots, at));
++  const arg = slots[at + 1] >>> 0, stack = slots[at + 2];
++  Atomics.store(slots, at, RUNNING);
++  const exports = m.initSync({ module, memory, thread_stack_size: stack });
++  try {
++    m.hzweb_thread_start(arg);
++  } catch (err) {
++    console.error('hzweb thread panicked:', err);
++  }
++  if (exports.__wbindgen_thread_destroy) exports.__wbindgen_thread_destroy();
++  Atomics.store(slots, at, DONE);
++  // Wake spawners waiting for a free slot.
++  Atomics.add(slots, count * FIELDS, 1);
++  Atomics.notify(slots, count * FIELDS);
++  postMessage('done');
++};
+diff --git a/web/runtime/serve.py b/web/runtime/serve.py
+new file mode 100644
+index 0000000..c2cba20
+--- /dev/null
++++ b/web/runtime/serve.py
+@@ -0,0 +1,13 @@
++#!/usr/bin/env python3
++"""Static server with the cross-origin isolation headers SharedArrayBuffer needs."""
++import http.server, sys, functools
++class H(http.server.SimpleHTTPRequestHandler):
++    def end_headers(self):
++        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
++        self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
++        self.send_header("Cache-Control", "no-cache")
++        super().end_headers()
++    def log_message(self, *a): pass
++H.extensions_map.update({".js": "text/javascript", ".wasm": "application/wasm", ".mjs": "text/javascript"})
++port = int(sys.argv[2]) if len(sys.argv) > 2 else 8123
++http.server.ThreadingHTTPServer(("127.0.0.1", port), functools.partial(H, directory=sys.argv[1])).serve_forever()
+diff --git a/web/std/apply.py b/web/std/apply.py
+new file mode 100644
+index 0000000..7b1d7b2
+--- /dev/null
++++ b/web/std/apply.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python3
++"""Patch the nightly toolchain's rust-src so wasm32-unknown-unknown std gets Horizon web's
++fs (in-memory VFS), time (performance.now/Date.now) and threads (Web Workers).
++Idempotent. Usage: python3 web/std/apply.py [SYSROOT]   (default: rustc +nightly --print sysroot)"""
++import os, subprocess, sys
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++sysroot = sys.argv[1] if len(sys.argv) > 1 else subprocess.check_output(
++    ["rustc", "+nightly", "--print", "sysroot"], text=True).strip()
++STD = os.path.join(sysroot, "lib/rustlib/src/rust/library/std/src")
++WEB = 'all(target_family = "wasm", target_os = "unknown")'
++MARK = "// hzweb-patched"
++
++
++def rd(p):
++    return open(os.path.join(STD, p)).read()
++
++
++def wr(p, s):
++    open(os.path.join(STD, p), "w").write(s)
++
++
++def copy(src, dst):
++    wr(dst, open(os.path.join(HERE, src)).read())
++
++
++def patch(path, old, new):
++    s = rd(path)
++    if MARK in s:
++        return
++    assert s.count(old) == 1, f"{path}: anchor not found once: {old!r}"
++    wr(path, MARK + "\n" + s.replace(old, new))
++
++
++copy("fs_hzweb.rs", "sys/fs/hzweb.rs")
++copy("time_hzweb.rs", "sys/time/hzweb.rs")
++copy("thread_hzweb.rs", "sys/thread/hzweb.rs")
++copy("os_hzweb.rs", "os/hzweb.rs")
++
++# fs: our module before the catch-all, plus the hooks std::os::hzweb calls.
++patch("sys/fs/mod.rs", "    _ => {\n        mod unsupported;\n        use unsupported as imp;\n    }\n}",
++      f"    {WEB} => {{\n        mod hzweb;\n        use hzweb as imp;\n        pub(crate) mod hzweb_hooks {{\n"
++      "            pub use super::hzweb::{vfs_file_count, vfs_mkdirs, vfs_put, vfs_take_change};\n        }\n    }\n"
++      "    _ => {\n        mod unsupported;\n        use unsupported as imp;\n    }\n}")
++
++# time: same, before the catch-all.
++patch("sys/time/mod.rs", "    _ => {\n        mod unsupported;\n        use unsupported as imp;\n    }",
++      f"    {WEB} => {{\n        mod hzweb;\n        use hzweb as imp;\n    }}\n"
++      "    _ => {\n        mod unsupported;\n        use unsupported as imp;\n    }")
++
++# thread: our arm ahead of the generic wasm+atomics one.
++patch("sys/thread/mod.rs", '    all(target_family = "wasm", target_feature = "atomics") => {',
++      f'    all({WEB[4:-1]}, target_feature = "atomics") => {{\n'
++      "        mod hzweb;\n"
++      "        pub use hzweb::{DEFAULT_MIN_STACK_SIZE, Thread, available_parallelism, current_os_id, set_name, sleep, yield_now};\n"
++      "        pub(crate) use hzweb::{is_main as hzweb_is_main, thread_start as hzweb_thread_start};\n"
++      "    }\n"
++      '    all(target_family = "wasm", target_feature = "atomics") => {')
++
++# futex: the browser's main thread may not block; spin there instead.
++patch("sys/sync/futex/wasm.rs",
++      "pub fn futex_wait(futex: &Atomic<u32>, expected: u32, timeout: Option<Duration>) -> bool {\n",
++      "pub fn futex_wait(futex: &Atomic<u32>, expected: u32, timeout: Option<Duration>) -> bool {\n"
++      '    #[cfg(target_os = "unknown")]\n'
++      "    if crate::sys::thread::hzweb_is_main() {\n"
++      "        use crate::sync::atomic::Ordering;\n"
++      "        let end = timeout.map(|t| crate::time::Instant::now() + t);\n"
++      "        while futex.load(Ordering::Acquire) == expected {\n"
++      "            if end.is_some_and(|e| crate::time::Instant::now() >= e) {\n"
++      "                return false;\n"
++      "            }\n"
++      "            crate::hint::spin_loop();\n"
++      "        }\n"
++      "        return true;\n"
++      "    }\n")
++
++# threads wait on the futex directly.
++patch("sys/sync/mod.rs", "mod futex;\n", "pub(crate) mod futex;\n")
++
++# std::os::hzweb
++patch("os/mod.rs", "pub mod raw;",
++      "pub mod raw;\n\n"
++      f"#[cfg({WEB})]\n"
++      '#[unstable(feature = "hzweb", issue = "none")]\n'
++      "pub mod hzweb;")
++
++print("std patched for hzweb:", STD)
+diff --git a/web/std/fs_hzweb.rs b/web/std/fs_hzweb.rs
+new file mode 100644
+index 0000000..7093388
+--- /dev/null
++++ b/web/std/fs_hzweb.rs
+@@ -0,0 +1,730 @@
++//! Horizon web: std::fs over an in-memory filesystem that lives in wasm memory, so every
++//! thread (Web Worker on the shared memory) sees the same files. JavaScript fills it at
++//! start (`std::os::hzweb::put`) and drains changed paths into IndexedDB
++//! (`std::os::hzweb::take_change`). Paths are absolute, '/'-separated; relative paths are
++//! taken from the virtual current directory `/`.
++
++use crate::collections::{BTreeMap, BTreeSet};
++use crate::ffi::OsString;
++use crate::fmt;
++use crate::fs::TryLockError;
++use crate::hash::{Hash, Hasher};
++use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut, SeekFrom};
++use crate::path::{Component, Path, PathBuf};
++use crate::sync::{Arc, Mutex, RwLock};
++pub use crate::sys::fs::common::{Dir, ExtraHomeDirs, ExtraMediaDirs};
++use crate::sys::time::SystemTime;
++
++
++type Data = Arc<RwLock<Vec<u8>>>;
++
++#[derive(Clone)]
++enum Node {
++    Dir { mtime: SystemTime },
++    File { data: Data, mtime: SystemTime },
++}
++
++struct Vfs {
++    nodes: BTreeMap<String, Node>,
++    /// Paths changed since JS last drained them (written, created or removed).
++    changed: BTreeSet<String>,
++}
++
++static VFS: Mutex<Vfs> = Mutex::new(Vfs { nodes: BTreeMap::new(), changed: BTreeSet::new() });
++
++fn now() -> SystemTime {
++    SystemTime::now()
++}
++
++/// `/a/./b/../c` and `a/c` -> `/a/c`. The root is `/`.
++fn norm(p: &Path) -> String {
++    let mut parts: crate::vec::Vec<String> = crate::vec::Vec::new();
++    for c in p.components() {
++        match c {
++            Component::RootDir | Component::Prefix(_) | Component::CurDir => {}
++            Component::ParentDir => {
++                parts.pop();
++            }
++            Component::Normal(s) => parts.push(s.to_string_lossy().into_owned()),
++        }
++    }
++    let mut out = String::from("/");
++    out.push_str(&parts.join("/"));
++    out
++}
++
++fn parent(path: &str) -> Option<&str> {
++    if path == "/" {
++        return None;
++    }
++    match path.rfind('/') {
++        Some(0) => Some("/"),
++        Some(i) => Some(&path[..i]),
++        None => None,
++    }
++}
++
++fn not_found() -> io::Error {
++    io::const_error!(io::ErrorKind::NotFound, "No such file or directory")
++}
++fn exists_err() -> io::Error {
++    io::const_error!(io::ErrorKind::AlreadyExists, "File exists")
++}
++fn is_dir_err() -> io::Error {
++    io::const_error!(io::ErrorKind::IsADirectory, "Is a directory")
++}
++fn not_dir_err() -> io::Error {
++    io::const_error!(io::ErrorKind::NotADirectory, "Not a directory")
++}
++
++impl Vfs {
++    fn mkdirs(&mut self, path: &str) {
++        let mut cur = Some(path);
++        let mut todo = crate::vec::Vec::new();
++        while let Some(p) = cur {
++            if self.nodes.contains_key(p) {
++                break;
++            }
++            todo.push(p.to_string());
++            cur = parent(p);
++        }
++        for p in todo.into_iter().rev() {
++            self.nodes.insert(p.clone(), Node::Dir { mtime: now() });
++            self.changed.insert(p);
++        }
++    }
++    fn parent_is_dir(&self, path: &str) -> io::Result<()> {
++        match parent(path) {
++            None => Ok(()),
++            Some("/") => Ok(()),
++            Some(p) => match self.nodes.get(p) {
++                Some(Node::Dir { .. }) => Ok(()),
++                Some(Node::File { .. }) => Err(not_dir_err()),
++                None => Err(not_found()),
++            },
++        }
++    }
++    fn children(&self, dir: &str) -> crate::vec::Vec<String> {
++        let prefix = if dir == "/" { String::from("/") } else { format!("{dir}/") };
++        self.nodes
++            .range(prefix.clone()..)
++            .take_while(|(k, _)| k.starts_with(&prefix))
++            .filter(|(k, _)| !k[prefix.len()..].contains('/') && k.len() > prefix.len())
++            .map(|(k, _)| k.clone())
++            .collect()
++    }
++}
++
++// ---- hooks for std::os::hzweb ----
++
++/// Adds or replaces a file (parents are created); not reported back as a change.
++pub fn vfs_put(path: &Path, data: Vec<u8>, record: bool) {
++    let p = norm(path);
++    let mut v = VFS.lock().unwrap();
++    if let Some(par) = parent(&p) {
++        let par = par.to_string();
++        let before = v.changed.clone();
++        v.mkdirs(&par);
++        if !record {
++            v.changed = before;
++        }
++    }
++    v.nodes.insert(p.clone(), Node::File { data: Arc::new(RwLock::new(data)), mtime: now() });
++    if record {
++        v.changed.insert(p);
++    }
++}
++
++pub fn vfs_mkdirs(path: &Path) {
++    let p = norm(path);
++    let mut v = VFS.lock().unwrap();
++    let before = v.changed.clone();
++    v.mkdirs(&p);
++    v.changed = before;
++}
++
++/// One changed path: `(path, Some(bytes))` for a file, `(path, None)` for a removed path,
++/// and directories as `(path/, None)`... directories are reported with a trailing '/'
++/// and empty contents. `None` when nothing changed.
++pub fn vfs_take_change() -> Option<(String, Option<Vec<u8>>)> {
++    let mut v = VFS.lock().unwrap();
++    let p = v.changed.pop_first()?;
++    Some(match v.nodes.get(&p) {
++        Some(Node::File { data, .. }) => (p, Some(data.read().unwrap().clone())),
++        Some(Node::Dir { .. }) => (format!("{p}/"), Some(Vec::new())),
++        None => (p, None),
++    })
++}
++
++pub fn vfs_file_count() -> usize {
++    VFS.lock().unwrap().nodes.len()
++}
++
++// ---- std types ----
++
++pub struct File {
++    path: String,
++    data: Data,
++    pos: Mutex<u64>,
++    append: bool,
++    write: bool,
++    read: bool,
++}
++
++#[derive(Clone)]
++pub struct FileAttr {
++    size: u64,
++    kind: FileType,
++    mtime: SystemTime,
++}
++
++pub struct ReadDir {
++    root: PathBuf,
++    entries: crate::vec::IntoIter<String>,
++}
++
++pub struct DirEntry {
++    path: String,
++}
++
++#[derive(Clone, Debug)]
++pub struct OpenOptions {
++    read: bool,
++    write: bool,
++    append: bool,
++    truncate: bool,
++    create: bool,
++    create_new: bool,
++}
++
++#[derive(Copy, Clone, Debug, Default)]
++pub struct FileTimes {
++    modified: Option<SystemTime>,
++}
++
++#[derive(Clone, PartialEq, Eq, Debug)]
++pub struct FilePermissions {
++    readonly: bool,
++}
++
++#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
++pub struct FileType {
++    dir: bool,
++}
++
++#[derive(Debug)]
++pub struct DirBuilder {}
++
++impl FileAttr {
++    pub fn size(&self) -> u64 {
++        self.size
++    }
++    pub fn perm(&self) -> FilePermissions {
++        FilePermissions { readonly: false }
++    }
++    pub fn file_type(&self) -> FileType {
++        self.kind
++    }
++    pub fn modified(&self) -> io::Result<SystemTime> {
++        Ok(self.mtime)
++    }
++    pub fn accessed(&self) -> io::Result<SystemTime> {
++        Ok(self.mtime)
++    }
++    pub fn created(&self) -> io::Result<SystemTime> {
++        Ok(self.mtime)
++    }
++}
++
++impl FilePermissions {
++    pub fn readonly(&self) -> bool {
++        self.readonly
++    }
++    pub fn set_readonly(&mut self, readonly: bool) {
++        self.readonly = readonly
++    }
++}
++
++impl FileTimes {
++    pub fn set_accessed(&mut self, _t: SystemTime) {}
++    pub fn set_modified(&mut self, t: SystemTime) {
++        self.modified = Some(t)
++    }
++}
++
++impl FileType {
++    pub fn is_dir(&self) -> bool {
++        self.dir
++    }
++    pub fn is_file(&self) -> bool {
++        !self.dir
++    }
++    pub fn is_symlink(&self) -> bool {
++        false
++    }
++}
++
++impl ReadDir {
++    pub fn dir(&self) -> io::Result<Dir> {
++        Err(io::Error::UNSUPPORTED_PLATFORM)
++    }
++}
++impl fmt::Debug for ReadDir {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("ReadDir").field("root", &self.root).finish()
++    }
++}
++impl Iterator for ReadDir {
++    type Item = io::Result<DirEntry>;
++    fn next(&mut self) -> Option<io::Result<DirEntry>> {
++        self.entries.next().map(|path| Ok(DirEntry { path }))
++    }
++}
++
++impl DirEntry {
++    pub fn path(&self) -> PathBuf {
++        PathBuf::from(&self.path)
++    }
++    pub fn file_name(&self) -> OsString {
++        OsString::from(self.path.rsplit('/').next().unwrap_or(""))
++    }
++    pub fn metadata(&self) -> io::Result<FileAttr> {
++        stat(Path::new(&self.path))
++    }
++    pub fn file_type(&self) -> io::Result<FileType> {
++        Ok(self.metadata()?.kind)
++    }
++}
++
++impl OpenOptions {
++    pub fn new() -> OpenOptions {
++        OpenOptions { read: false, write: false, append: false, truncate: false, create: false, create_new: false }
++    }
++    pub fn read(&mut self, v: bool) {
++        self.read = v
++    }
++    pub fn write(&mut self, v: bool) {
++        self.write = v
++    }
++    pub fn append(&mut self, v: bool) {
++        self.append = v
++    }
++    pub fn truncate(&mut self, v: bool) {
++        self.truncate = v
++    }
++    pub fn create(&mut self, v: bool) {
++        self.create = v
++    }
++    pub fn create_new(&mut self, v: bool) {
++        self.create_new = v
++    }
++}
++
++impl File {
++    pub fn open(path: &Path, opts: &OpenOptions) -> io::Result<File> {
++        let p = norm(path);
++        let writes = opts.write || opts.append;
++        let mut v = VFS.lock().unwrap();
++        let data = match v.nodes.get(&p) {
++            Some(Node::Dir { .. }) => {
++                if writes {
++                    return Err(is_dir_err());
++                }
++                // Reading a directory as a file: std allows opening it on unix.
++                Arc::new(RwLock::new(Vec::new()))
++            }
++            Some(Node::File { data, .. }) => {
++                let data = data.clone();
++                if opts.create_new {
++                    return Err(exists_err());
++                }
++                if opts.truncate && writes {
++                    data.write().unwrap().clear();
++                    v.changed.insert(p.clone());
++                }
++                data
++            }
++            None => {
++                if !(opts.create || opts.create_new) || !writes {
++                    return Err(not_found());
++                }
++                v.parent_is_dir(&p)?;
++                let data: Data = Arc::new(RwLock::new(Vec::new()));
++                v.nodes.insert(p.clone(), Node::File { data: data.clone(), mtime: now() });
++                v.changed.insert(p.clone());
++                data
++            }
++        };
++        Ok(File {
++            path: p,
++            data,
++            pos: Mutex::new(0),
++            append: opts.append,
++            write: writes,
++            read: opts.read || !writes,
++        })
++    }
++
++    fn touched(&self) {
++        let mut v = VFS.lock().unwrap();
++        if let Some(Node::File { mtime, .. }) = v.nodes.get_mut(&self.path) {
++            *mtime = now();
++        }
++        v.changed.insert(self.path.clone());
++    }
++
++    pub fn file_attr(&self) -> io::Result<FileAttr> {
++        let size = self.data.read().unwrap().len() as u64;
++        let mtime = match VFS.lock().unwrap().nodes.get(&self.path) {
++            Some(Node::File { mtime, .. }) | Some(Node::Dir { mtime }) => *mtime,
++            None => now(),
++        };
++        Ok(FileAttr { size, kind: FileType { dir: false }, mtime })
++    }
++    pub fn fsync(&self) -> io::Result<()> {
++        Ok(())
++    }
++    pub fn datasync(&self) -> io::Result<()> {
++        Ok(())
++    }
++    pub fn lock(&self) -> io::Result<()> {
++        Ok(())
++    }
++    pub fn lock_shared(&self) -> io::Result<()> {
++        Ok(())
++    }
++    pub fn try_lock(&self) -> Result<(), TryLockError> {
++        Ok(())
++    }
++    pub fn try_lock_shared(&self) -> Result<(), TryLockError> {
++        Ok(())
++    }
++    pub fn unlock(&self) -> io::Result<()> {
++        Ok(())
++    }
++    pub fn truncate(&self, size: u64) -> io::Result<()> {
++        if !self.write {
++            return Err(io::const_error!(io::ErrorKind::PermissionDenied, "not opened for writing"));
++        }
++        self.data.write().unwrap().resize(size as usize, 0);
++        self.touched();
++        Ok(())
++    }
++    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
++        if !self.read {
++            return Err(io::const_error!(io::ErrorKind::PermissionDenied, "not opened for reading"));
++        }
++        let data = self.data.read().unwrap();
++        let mut pos = self.pos.lock().unwrap();
++        let start = (*pos as usize).min(data.len());
++        let n = buf.len().min(data.len() - start);
++        buf[..n].copy_from_slice(&data[start..start + n]);
++        *pos += n as u64;
++        Ok(n)
++    }
++    pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
++        crate::io::default_read_vectored(|b| self.read(b), bufs)
++    }
++    pub fn is_read_vectored(&self) -> bool {
++        false
++    }
++    pub fn read_buf(&self, cursor: BorrowedCursor<'_, u8>) -> io::Result<()> {
++        crate::io::default_read_buf(|b| self.read(b), cursor)
++    }
++    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
++        if !self.write {
++            return Err(io::const_error!(io::ErrorKind::PermissionDenied, "not opened for writing"));
++        }
++        {
++            let mut data = self.data.write().unwrap();
++            let mut pos = self.pos.lock().unwrap();
++            if self.append {
++                *pos = data.len() as u64;
++            }
++            let start = *pos as usize;
++            if data.len() < start {
++                data.resize(start, 0);
++            }
++            let end = start + buf.len();
++            if data.len() < end {
++                data.resize(end, 0);
++            }
++            data[start..end].copy_from_slice(buf);
++            *pos = end as u64;
++        }
++        self.touched();
++        Ok(buf.len())
++    }
++    pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
++        crate::io::default_write_vectored(|b| self.write(b), bufs)
++    }
++    pub fn is_write_vectored(&self) -> bool {
++        false
++    }
++    pub fn flush(&self) -> io::Result<()> {
++        Ok(())
++    }
++    pub fn seek(&self, to: SeekFrom) -> io::Result<u64> {
++        let len = self.data.read().unwrap().len() as i128;
++        let mut pos = self.pos.lock().unwrap();
++        let new = match to {
++            SeekFrom::Start(n) => n as i128,
++            SeekFrom::End(d) => len + d as i128,
++            SeekFrom::Current(d) => *pos as i128 + d as i128,
++        };
++        if new < 0 {
++            return Err(io::const_error!(io::ErrorKind::InvalidInput, "seek before start"));
++        }
++        *pos = new as u64;
++        Ok(*pos)
++    }
++    pub fn size(&self) -> Option<io::Result<u64>> {
++        Some(Ok(self.data.read().unwrap().len() as u64))
++    }
++    pub fn tell(&self) -> io::Result<u64> {
++        Ok(*self.pos.lock().unwrap())
++    }
++    pub fn duplicate(&self) -> io::Result<File> {
++        Ok(File {
++            path: self.path.clone(),
++            data: self.data.clone(),
++            pos: Mutex::new(*self.pos.lock().unwrap()),
++            append: self.append,
++            write: self.write,
++            read: self.read,
++        })
++    }
++    pub fn set_permissions(&self, _perm: FilePermissions) -> io::Result<()> {
++        Ok(())
++    }
++    pub fn set_times(&self, times: FileTimes) -> io::Result<()> {
++        set_times(Path::new(&self.path), times)
++    }
++}
++
++impl fmt::Debug for File {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("File").field("path", &self.path).finish()
++    }
++}
++
++impl DirBuilder {
++    pub fn new() -> DirBuilder {
++        DirBuilder {}
++    }
++    pub fn mkdir(&self, p: &Path) -> io::Result<()> {
++        let p = norm(p);
++        let mut v = VFS.lock().unwrap();
++        if v.nodes.contains_key(&p) || p == "/" {
++            return Err(exists_err());
++        }
++        v.parent_is_dir(&p)?;
++        v.nodes.insert(p.clone(), Node::Dir { mtime: now() });
++        v.changed.insert(p);
++        Ok(())
++    }
++}
++
++pub fn readdir(p: &Path) -> io::Result<ReadDir> {
++    let n = norm(p);
++    let v = VFS.lock().unwrap();
++    if n != "/" {
++        match v.nodes.get(&n) {
++            Some(Node::Dir { .. }) => {}
++            Some(Node::File { .. }) => return Err(not_dir_err()),
++            None => return Err(not_found()),
++        }
++    }
++    Ok(ReadDir { root: PathBuf::from(&n), entries: v.children(&n).into_iter() })
++}
++
++pub fn unlink(p: &Path) -> io::Result<()> {
++    let p = norm(p);
++    let mut v = VFS.lock().unwrap();
++    match v.nodes.get(&p) {
++        Some(Node::File { .. }) => {
++            v.nodes.remove(&p);
++            v.changed.insert(p);
++            Ok(())
++        }
++        Some(Node::Dir { .. }) => Err(is_dir_err()),
++        None => Err(not_found()),
++    }
++}
++
++pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
++    let (o, n) = (norm(old), norm(new));
++    if o == n {
++        return Ok(());
++    }
++    let mut v = VFS.lock().unwrap();
++    let node = v.nodes.get(&o).cloned().ok_or_else(not_found)?;
++    v.parent_is_dir(&n)?;
++    match node {
++        Node::File { .. } => {
++            if let Some(Node::Dir { .. }) = v.nodes.get(&n) {
++                return Err(is_dir_err());
++            }
++            v.nodes.remove(&o);
++            v.nodes.insert(n.clone(), node);
++        }
++        Node::Dir { .. } => {
++            if let Some(Node::Dir { .. }) = v.nodes.get(&n) {
++                if !v.children(&n).is_empty() {
++                    return Err(io::const_error!(io::ErrorKind::DirectoryNotEmpty, "Directory not empty"));
++                }
++            }
++            let prefix = format!("{o}/");
++            let moved: crate::vec::Vec<String> = v
++                .nodes
++                .range(prefix.clone()..)
++                .take_while(|(k, _)| k.starts_with(&prefix))
++                .map(|(k, _)| k.clone())
++                .collect();
++            v.nodes.remove(&o);
++            v.nodes.insert(n.clone(), node);
++            v.changed.insert(o.clone());
++            for k in moved {
++                let node = v.nodes.remove(&k).unwrap();
++                let nk = format!("{n}{}", &k[o.len()..]);
++                v.changed.insert(k);
++                v.changed.insert(nk.clone());
++                v.nodes.insert(nk, node);
++            }
++        }
++    }
++    v.changed.insert(o);
++    v.changed.insert(n);
++    Ok(())
++}
++
++pub fn rename_noreplace(old: &Path, new: &Path) -> io::Result<()> {
++    if exists(new)? {
++        return Err(exists_err());
++    }
++    rename(old, new)
++}
++
++pub fn set_perm(_p: &Path, _perm: FilePermissions) -> io::Result<()> {
++    Ok(())
++}
++pub fn set_perm_nofollow(p: &Path, perm: FilePermissions) -> io::Result<()> {
++    set_perm(p, perm)
++}
++
++pub fn set_times(p: &Path, times: FileTimes) -> io::Result<()> {
++    let p = norm(p);
++    let mut v = VFS.lock().unwrap();
++    match v.nodes.get_mut(&p) {
++        Some(Node::File { mtime, .. }) | Some(Node::Dir { mtime }) => {
++            if let Some(t) = times.modified {
++                *mtime = t;
++            }
++            Ok(())
++        }
++        None => Err(not_found()),
++    }
++}
++pub fn set_times_nofollow(p: &Path, times: FileTimes) -> io::Result<()> {
++    set_times(p, times)
++}
++
++pub fn rmdir(p: &Path) -> io::Result<()> {
++    let p = norm(p);
++    let mut v = VFS.lock().unwrap();
++    match v.nodes.get(&p) {
++        Some(Node::Dir { .. }) => {
++            if !v.children(&p).is_empty() {
++                return Err(io::const_error!(io::ErrorKind::DirectoryNotEmpty, "Directory not empty"));
++            }
++            v.nodes.remove(&p);
++            v.changed.insert(p);
++            Ok(())
++        }
++        Some(Node::File { .. }) => Err(not_dir_err()),
++        None => Err(not_found()),
++    }
++}
++
++pub fn remove_dir_all(path: &Path) -> io::Result<()> {
++    let p = norm(path);
++    let mut v = VFS.lock().unwrap();
++    match v.nodes.get(&p) {
++        Some(Node::Dir { .. }) => {}
++        Some(Node::File { .. }) => return Err(not_dir_err()),
++        None => return Err(not_found()),
++    }
++    let prefix = format!("{p}/");
++    let gone: crate::vec::Vec<String> = v
++        .nodes
++        .range(prefix.clone()..)
++        .take_while(|(k, _)| k.starts_with(&prefix))
++        .map(|(k, _)| k.clone())
++        .collect();
++    for k in gone {
++        v.nodes.remove(&k);
++        v.changed.insert(k);
++    }
++    v.nodes.remove(&p);
++    v.changed.insert(p);
++    Ok(())
++}
++
++pub fn exists(path: &Path) -> io::Result<bool> {
++    let p = norm(path);
++    Ok(p == "/" || VFS.lock().unwrap().nodes.contains_key(&p))
++}
++
++pub fn readlink(_p: &Path) -> io::Result<PathBuf> {
++    Err(io::const_error!(io::ErrorKind::InvalidInput, "not a symlink"))
++}
++pub fn symlink(_original: &Path, _link: &Path) -> io::Result<()> {
++    Err(io::Error::UNSUPPORTED_PLATFORM)
++}
++pub fn link(src: &Path, dst: &Path) -> io::Result<()> {
++    copy(src, dst).map(|_| ())
++}
++
++pub fn stat(p: &Path) -> io::Result<FileAttr> {
++    let p = norm(p);
++    if p == "/" {
++        return Ok(FileAttr { size: 0, kind: FileType { dir: true }, mtime: crate::sys::time::UNIX_EPOCH });
++    }
++    let v = VFS.lock().unwrap();
++    match v.nodes.get(&p) {
++        Some(Node::Dir { mtime }) => Ok(FileAttr { size: 0, kind: FileType { dir: true }, mtime: *mtime }),
++        Some(Node::File { data, mtime }) => {
++            Ok(FileAttr { size: data.read().unwrap().len() as u64, kind: FileType { dir: false }, mtime: *mtime })
++        }
++        None => Err(not_found()),
++    }
++}
++pub fn lstat(p: &Path) -> io::Result<FileAttr> {
++    stat(p)
++}
++
++pub fn canonicalize(p: &Path) -> io::Result<PathBuf> {
++    let n = norm(p);
++    if exists(Path::new(&n))? { Ok(PathBuf::from(n)) } else { Err(not_found()) }
++}
++
++pub fn copy(from: &Path, to: &Path) -> io::Result<u64> {
++    let (f, t) = (norm(from), norm(to));
++    let mut v = VFS.lock().unwrap();
++    let bytes = match v.nodes.get(&f) {
++        Some(Node::File { data, .. }) => data.read().unwrap().clone(),
++        Some(Node::Dir { .. }) => return Err(is_dir_err()),
++        None => return Err(not_found()),
++    };
++    v.parent_is_dir(&t)?;
++    let len = bytes.len() as u64;
++    v.nodes.insert(t.clone(), Node::File { data: Arc::new(RwLock::new(bytes)), mtime: now() });
++    v.changed.insert(t);
++    Ok(len)
++}
++
++impl Hash for FileAttr {
++    fn hash<H: Hasher>(&self, h: &mut H) {
++        self.size.hash(h);
++    }
++}
+diff --git a/web/std/os_hzweb.rs b/web/std/os_hzweb.rs
+new file mode 100644
+index 0000000..c40ed7b
+--- /dev/null
++++ b/web/std/os_hzweb.rs
+@@ -0,0 +1,38 @@
++//! Horizon web: the hooks JavaScript needs into std's virtual filesystem and threads.
++
++use crate::path::Path;
++
++/// Puts a file into the virtual filesystem (parents created), e.g. from the resource pack.
++/// `record`: report it as changed (for saves restored from IndexedDB: false).
++pub fn put(path: &Path, data: Vec<u8>, record: bool) {
++    crate::sys::fs::hzweb_hooks::vfs_put(path, data, record)
++}
++
++/// Creates a directory and its parents without reporting a change.
++pub fn mkdirs(path: &Path) {
++    crate::sys::fs::hzweb_hooks::vfs_mkdirs(path)
++}
++
++/// The next changed path since the last call: `Some(bytes)` for a file (a directory ends
++/// in '/' with empty bytes), `None` for a removed path.
++pub fn take_change() -> Option<(String, Option<Vec<u8>>)> {
++    crate::sys::fs::hzweb_hooks::vfs_take_change()
++}
++
++/// How many files and directories exist.
++pub fn file_count() -> usize {
++    crate::sys::fs::hzweb_hooks::vfs_file_count()
++}
++
++/// Entry point of a spawned thread's worker.
++///
++/// # Safety
++/// `arg` must be the value JS received from `hz_spawn`, used once.
++pub unsafe fn thread_start(arg: u32) {
++    unsafe { crate::sys::thread::hzweb_thread_start(arg) }
++}
++
++/// Whether this is the browser's main thread.
++pub fn is_main_thread() -> bool {
++    crate::sys::thread::hzweb_is_main()
++}
+diff --git a/web/std/thread_hzweb.rs b/web/std/thread_hzweb.rs
+new file mode 100644
+index 0000000..1ca75df
+--- /dev/null
++++ b/web/std/thread_hzweb.rs
+@@ -0,0 +1,94 @@
++//! Horizon web: threads are Web Workers on the shared wasm memory. `hz_spawn` asks JS for a
++//! worker, which instantiates the module on this memory and calls
++//! `std::os::hzweb::thread_start(ptr)` (exported by the game as `hzweb_thread_start`).
++use crate::ffi::CStr;
++use crate::io;
++use crate::num::NonZero;
++use crate::sync::Arc;
++use crate::sync::atomic::{Atomic, AtomicU32, Ordering};
++use crate::thread::ThreadInit;
++use crate::time::Duration;
++
++#[link(wasm_import_module = "hzweb")]
++unsafe extern "C" {
++    /// Starts a worker that will call `thread_start(arg)`. 0 on success.
++    fn hz_spawn(arg: u32, stack: u32) -> i32;
++    fn hz_cores() -> u32;
++    /// 1 on the browser's main thread, where blocking waits are forbidden.
++    fn hz_is_main() -> u32;
++}
++
++pub fn is_main() -> bool {
++    unsafe { hz_is_main() != 0 }
++}
++
++pub const DEFAULT_MIN_STACK_SIZE: usize = 1024 * 1024;
++
++struct Start {
++    init: Box<ThreadInit>,
++    done: Arc<AtomicU32>,
++}
++
++pub struct Thread {
++    done: Arc<AtomicU32>,
++}
++
++impl Thread {
++    pub unsafe fn new(stack: usize, init: Box<ThreadInit>) -> io::Result<Thread> {
++        let done = Arc::new(AtomicU32::new(0));
++        let start = Box::into_raw(Box::new(Start { init, done: done.clone() }));
++        let ok = unsafe { hz_spawn(start as u32, stack.max(DEFAULT_MIN_STACK_SIZE) as u32) };
++        if ok != 0 {
++            drop(unsafe { Box::from_raw(start) });
++            return Err(io::const_error!(io::ErrorKind::Other, "could not start a Web Worker"));
++        }
++        Ok(Thread { done })
++    }
++
++    pub fn join(self) {
++        while self.done.load(Ordering::Acquire) == 0 {
++            crate::sys::sync::futex::futex_wait(&self.done, 0, None);
++        }
++    }
++}
++
++/// Runs a spawned thread's body on the worker that JS started for it.
++pub unsafe fn thread_start(arg: u32) {
++    let start = unsafe { Box::from_raw(arg as *mut Start) };
++    let Start { init, done } = *start;
++    let rust_start = init.init();
++    rust_start();
++    done.store(1, Ordering::Release);
++    crate::sys::sync::futex::futex_wake_all(&done);
++}
++
++pub fn available_parallelism() -> io::Result<NonZero<usize>> {
++    NonZero::new(unsafe { hz_cores() } as usize).ok_or(io::Error::UNKNOWN_THREAD_COUNT)
++}
++
++pub fn current_os_id() -> Option<u64> {
++    None
++}
++
++pub fn yield_now() {}
++
++pub fn set_name(_name: &CStr) {}
++
++pub fn sleep(dur: Duration) {
++    if is_main() {
++        let end = crate::time::Instant::now() + dur;
++        while crate::time::Instant::now() < end {
++            crate::hint::spin_loop();
++        }
++        return;
++    }
++    let mut nanos = dur.as_nanos();
++    while nanos > 0 {
++        let amt = crate::cmp::min(i64::MAX as u128, nanos);
++        let x: Atomic<u32> = AtomicU32::new(0);
++        unsafe {
++            core::arch::wasm32::memory_atomic_wait32(x.as_ptr() as *mut i32, 0, amt as i64);
++        }
++        nanos -= amt;
++    }
++}
+diff --git a/web/std/time_hzweb.rs b/web/std/time_hzweb.rs
+new file mode 100644
+index 0000000..0a9bc3b
+--- /dev/null
++++ b/web/std/time_hzweb.rs
+@@ -0,0 +1,55 @@
++//! Horizon web: Instant from `performance.timeOrigin + performance.now()` (the same clock
++//! in every Web Worker), SystemTime from `Date.now()`.
++use crate::time::Duration;
++
++#[link(wasm_import_module = "hzweb")]
++unsafe extern "C" {
++    /// Milliseconds on a clock shared by all threads (fractional).
++    fn hz_now_ms() -> f64;
++    /// Milliseconds since the Unix epoch.
++    fn hz_date_ms() -> f64;
++}
++
++fn ms(v: f64) -> Duration {
++    Duration::from_nanos((v.max(0.0) * 1_000_000.0) as u64)
++}
++
++#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
++pub struct Instant(Duration);
++
++#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
++pub struct SystemTime(Duration);
++
++pub const UNIX_EPOCH: SystemTime = SystemTime(Duration::from_secs(0));
++
++impl Instant {
++    pub fn now() -> Instant {
++        Instant(ms(unsafe { hz_now_ms() }))
++    }
++    pub fn checked_sub_instant(&self, other: &Instant) -> Option<Duration> {
++        self.0.checked_sub(other.0)
++    }
++    pub fn checked_add_duration(&self, other: &Duration) -> Option<Instant> {
++        Some(Instant(self.0.checked_add(*other)?))
++    }
++    pub fn checked_sub_duration(&self, other: &Duration) -> Option<Instant> {
++        Some(Instant(self.0.checked_sub(*other)?))
++    }
++}
++
++impl SystemTime {
++    pub const MAX: SystemTime = SystemTime(Duration::MAX);
++    pub const MIN: SystemTime = SystemTime(Duration::ZERO);
++    pub fn now() -> SystemTime {
++        SystemTime(ms(unsafe { hz_date_ms() }))
++    }
++    pub fn sub_time(&self, other: &SystemTime) -> Result<Duration, Duration> {
++        self.0.checked_sub(other.0).ok_or_else(|| other.0 - self.0)
++    }
++    pub fn checked_add_duration(&self, other: &Duration) -> Option<SystemTime> {
++        Some(SystemTime(self.0.checked_add(*other)?))
++    }
++    pub fn checked_sub_duration(&self, other: &Duration) -> Option<SystemTime> {
++        Some(SystemTime(self.0.checked_sub(*other)?))
++    }
++}
+-- 
+2.43.0
+
