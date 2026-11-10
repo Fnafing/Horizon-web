@@ -1,5 +1,7 @@
 # Horizon Web (WIP)
 
+<img width="1320" height="685" alt="4mrmxgaz" src="https://github.com/user-attachments/assets/9c784b9e-5c06-4158-b538-58eda954ff59" />
+
 Minecraft Java 26.3 in the browser, built on [Horizon](https://github.com/horizon-rust/horizon) (MIT).
 Unofficial. No Minecraft code or assets here: players make their own `.hzpack` with mcpack from their own copy.
 
